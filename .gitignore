@@ -3,3 +3,4 @@
 *.bc
 *.so
 *.a
+/pg_columnar.dylib
