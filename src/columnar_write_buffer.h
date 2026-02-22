@@ -34,6 +34,14 @@ typedef struct ColumnarWriteBuffer
 	ColumnBuffer *columns;
 	int64_t		nrows;
 	struct ArrowSchema schema;
+	/*
+	 * The 1-based block number that this write buffer will occupy once
+	 * flushed to disk.  Equals (number of on-disk stripes at buffer
+	 * creation time) + 1, and is incremented after each auto-flush so
+	 * that TIDs assigned during INSERT remain correct after the flush
+	 * makes the batch a new on-disk stripe.
+	 */
+	int			wb_stripe_block;
 	struct ColumnarWriteBuffer *next;	/* linked list */
 } ColumnarWriteBuffer;
 

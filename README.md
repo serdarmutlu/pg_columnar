@@ -164,12 +164,21 @@ print(table.to_pandas())
 
 Compressed stripes (written with `columnar.compression = 'zstd'` or `'lz4'`) must be decompressed first before passing to an Arrow reader.
 
+## Indexes
+
+Standard B-tree indexes are supported on columnar tables:
+
+```sql
+CREATE INDEX ON measurements (sensor);
+CREATE INDEX ON measurements (value, sensor);
+REINDEX INDEX measurements_sensor_idx;
+```
+
+Index scans and index-only scans work correctly. Indexes can be created before or after data is loaded.
+
 ## Current Limitations
 
-This is a Phase 1 implementation:
-
 - **No UPDATE/DELETE** -- these operations raise an error
-- **No indexes** -- index creation is not supported
 - **No MVCC** -- no snapshot isolation for columnar data
 - **No WAL logging** -- crash safety is limited to fsync
 - **No parallel scan**

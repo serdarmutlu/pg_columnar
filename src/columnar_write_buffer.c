@@ -76,6 +76,21 @@ columnar_get_write_buffer(Relation rel)
 		buf->columns = palloc0(sizeof(ColumnBuffer) * natts);
 		buf->nrows = 0;
 
+		/*
+		 * Determine which stripe block number this write buffer will
+		 * correspond to once flushed.  Read the current on-disk stripe
+		 * count so that TIDs assigned during INSERT stay consistent with
+		 * the on-disk stripe numbering.
+		 */
+		{
+			ColumnarMetadata *meta = columnar_read_metadata(&buf->locator);
+
+			buf->wb_stripe_block = meta->num_stripes + 1;
+			if (meta->stripes)
+				pfree(meta->stripes);
+			pfree(meta);
+		}
+
 		/* Build Arrow schema from TupleDesc */
 		columnar_build_arrow_schema(&buf->schema, tupdesc);
 
@@ -217,6 +232,12 @@ columnar_flush_write_buffer(ColumnarWriteBuffer *buf)
 	}
 
 	buf->nrows = 0;
+
+	/*
+	 * Advance wb_stripe_block so that TIDs assigned to subsequent rows
+	 * (after an auto-flush) correctly reference the next stripe slot.
+	 */
+	buf->wb_stripe_block++;
 }
 
 void
