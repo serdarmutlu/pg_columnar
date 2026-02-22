@@ -35,7 +35,7 @@ columnar_dir_path(const RelFileLocator *locator)
 	char	   *path = palloc(MAXPGPATH);
 
 	snprintf(path, MAXPGPATH, "%s/columnar/%u/%u",
-			 DataDir, locator->dbOid, locator->relNumber);
+			 DataDir, PG_LOCATOR_DB(locator), PG_LOCATOR_REL(locator));
 	return path;
 }
 
@@ -45,7 +45,7 @@ columnar_stripe_path(const RelFileLocator *locator, int stripe_id)
 	char	   *path = palloc(MAXPGPATH);
 
 	snprintf(path, MAXPGPATH, "%s/columnar/%u/%u/stripe_%06d.arrow",
-			 DataDir, locator->dbOid, locator->relNumber, stripe_id);
+			 DataDir, PG_LOCATOR_DB(locator), PG_LOCATOR_REL(locator), stripe_id);
 	return path;
 }
 
@@ -55,7 +55,7 @@ columnar_metadata_path(const RelFileLocator *locator)
 	char	   *path = palloc(MAXPGPATH);
 
 	snprintf(path, MAXPGPATH, "%s/columnar/%u/%u/metadata",
-			 DataDir, locator->dbOid, locator->relNumber);
+			 DataDir, PG_LOCATOR_DB(locator), PG_LOCATOR_REL(locator));
 	return path;
 }
 
@@ -73,7 +73,7 @@ columnar_create_storage(const RelFileLocator *locator)
 	(void) mkdir(base, S_IRWXU);
 
 	/* $PGDATA/columnar/<dbOid> */
-	snprintf(dbdir, MAXPGPATH, "%s/columnar/%u", DataDir, locator->dbOid);
+	snprintf(dbdir, MAXPGPATH, "%s/columnar/%u", DataDir, PG_LOCATOR_DB(locator));
 	(void) mkdir(dbdir, S_IRWXU);
 
 	/* $PGDATA/columnar/<dbOid>/<relNumber> */

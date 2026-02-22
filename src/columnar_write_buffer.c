@@ -4,6 +4,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
+#include "pg_compat.h"
 #include "nanoarrow.h"
 #include "nanoarrow_ipc.h"
 #include "columnar_write_buffer.h"
@@ -67,7 +68,7 @@ columnar_get_write_buffer(Relation rel)
 
 		buf = palloc0(sizeof(ColumnarWriteBuffer));
 		buf->relid = RelationGetRelid(rel);
-		buf->locator = rel->rd_locator;
+		buf->locator = *RelationGetLocator(rel);
 
 		tupdesc = RelationGetDescr(rel);
 		natts = tupdesc->natts;

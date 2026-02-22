@@ -24,6 +24,7 @@
 
 #include "nanoarrow.h"
 #include "nanoarrow_ipc.h"
+#include "pg_compat.h"
 #include "columnar_storage.h"
 #include "columnar_write_buffer.h"
 #include "columnar_typemap.h"
@@ -75,7 +76,7 @@ columnar_open_stripe(ColumnarScanDesc scan, int stripe_idx)
 	struct ArrowIpcInputStream input_stream;
 	int			rc;
 
-	filepath = columnar_stripe_path(&rel->rd_locator, sm->stripe_id);
+	filepath = columnar_stripe_path(RelationGetLocator(rel), sm->stripe_id);
 
 	if (sm->compression == COLUMNAR_COMPRESSION_NONE)
 	{
@@ -270,7 +271,7 @@ columnar_scan_begin(Relation rel, Snapshot snapshot,
 	scan->base.rs_flags = flags;
 	scan->base.rs_parallel = pscan;
 
-	meta = columnar_read_metadata(&rel->rd_locator);
+	meta = columnar_read_metadata(RelationGetLocator(rel));
 	scan->current_stripe = 0;
 	scan->stream_open = false;
 	scan->has_batch = false;
@@ -697,6 +698,7 @@ columnar_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 	return true;
 }
 
+#if PG_VERSION_NUM >= 150000
 static TransactionId
 columnar_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 {
@@ -705,6 +707,19 @@ columnar_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 			 errmsg("columnar tables do not support index deletion")));
 	return InvalidTransactionId;
 }
+#else
+static TransactionId
+columnar_index_delete_tuples(Relation rel, TM_IndexDelete *delstate,
+							 int ndelstate, TM_IndexStatus *status,
+							 int nstatus, TransactionId oldestXmin,
+							 bool knowndead)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("columnar tables do not support index deletion")));
+	return InvalidTransactionId;
+}
+#endif
 
 /* ----------------------------------------------------------------
  * Tuple insert / multi_insert
@@ -802,6 +817,7 @@ columnar_tuple_delete(Relation rel, ItemPointer tid,
 	return TM_Ok;
 }
 
+#if PG_VERSION_NUM >= 150000
 static TM_Result
 columnar_tuple_update(Relation rel, ItemPointer otid,
 					  TupleTableSlot *slot, CommandId cid,
@@ -815,6 +831,21 @@ columnar_tuple_update(Relation rel, ItemPointer otid,
 			 errmsg("columnar tables do not support UPDATE")));
 	return TM_Ok;
 }
+#else
+static TM_Result
+columnar_tuple_update(Relation rel, ItemPointer otid,
+					  TupleTableSlot *slot, CommandId cid,
+					  Snapshot snapshot, Snapshot crosscheck,
+					  bool wait, TM_FailureData *tmfd,
+					  LockTupleMode *lockmode,
+					  bool *update_indexes)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("columnar tables do not support UPDATE")));
+	return TM_Ok;
+}
+#endif
 
 static TM_Result
 columnar_tuple_lock(Relation rel, ItemPointer tid,
@@ -842,6 +873,7 @@ columnar_finish_bulk_insert(Relation rel, int options)
  * DDL callbacks
  * ----------------------------------------------------------------
  */
+#if PG_VERSION_NUM >= 170000
 static void
 columnar_relation_set_new_filelocator(Relation rel,
 									  const RelFileLocator *newrlocator,
@@ -854,14 +886,29 @@ columnar_relation_set_new_filelocator(Relation rel,
 
 	columnar_create_storage(newrlocator);
 }
+#else
+static void
+columnar_relation_set_new_filenode(Relation rel,
+								   const RelFileNode *newrnode,
+								   char persistence,
+								   TransactionId *freezeXid,
+								   MultiXactId *minmulti)
+{
+	*freezeXid = InvalidTransactionId;
+	*minmulti = InvalidMultiXactId;
+
+	columnar_create_storage(newrnode);
+}
+#endif
 
 static void
 columnar_relation_nontransactional_truncate(Relation rel)
 {
-	columnar_remove_storage(&rel->rd_locator);
-	columnar_create_storage(&rel->rd_locator);
+	columnar_remove_storage(RelationGetLocator(rel));
+	columnar_create_storage(RelationGetLocator(rel));
 }
 
+#if PG_VERSION_NUM >= 170000
 static void
 columnar_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 {
@@ -869,6 +916,15 @@ columnar_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("columnar tables do not support tablespace changes")));
 }
+#else
+static void
+columnar_relation_copy_data(Relation rel, const RelFileNode *newrnode)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("columnar tables do not support tablespace changes")));
+}
+#endif
 
 static void
 columnar_relation_copy_for_cluster(Relation OldTable, Relation NewTable,
@@ -896,11 +952,19 @@ columnar_relation_vacuum(Relation rel, struct VacuumParams *params,
  * ANALYZE stubs
  * ----------------------------------------------------------------
  */
+#if PG_VERSION_NUM >= 170000
 static bool
 columnar_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream)
 {
 	return false;
 }
+#else
+static bool
+columnar_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno)
+{
+	return false;
+}
+#endif
 
 static bool
 columnar_scan_analyze_next_tuple(TableScanDesc scan,
@@ -952,7 +1016,7 @@ columnar_relation_size(Relation rel, ForkNumber forkNumber)
 	if (forkNumber != MAIN_FORKNUM)
 		return 0;
 
-	return columnar_storage_size(&rel->rd_locator);
+	return columnar_storage_size(RelationGetLocator(rel));
 }
 
 static bool
@@ -971,7 +1035,7 @@ columnar_relation_estimate_size(Relation rel, int32 *attr_widths,
 	uint64		total_size;
 	int64_t		total_rows;
 
-	meta = columnar_read_metadata(&rel->rd_locator);
+	meta = columnar_read_metadata(RelationGetLocator(rel));
 	total_rows = meta->total_rows;
 	if (meta->stripes)
 		pfree(meta->stripes);
@@ -981,7 +1045,7 @@ columnar_relation_estimate_size(Relation rel, int32 *attr_widths,
 	if (wb != NULL)
 		total_rows += wb->nrows;
 
-	total_size = columnar_storage_size(&rel->rd_locator);
+	total_size = columnar_storage_size(RelationGetLocator(rel));
 
 	*pages = (BlockNumber) Max(1, total_size / BLCKSZ);
 	*tuples = (double) total_rows;
@@ -1048,7 +1112,11 @@ const TableAmRoutine columnar_am_methods = {
 	.tuple_lock = columnar_tuple_lock,
 	.finish_bulk_insert = columnar_finish_bulk_insert,
 
+#if PG_VERSION_NUM >= 170000
 	.relation_set_new_filelocator = columnar_relation_set_new_filelocator,
+#else
+	.relation_set_new_filenode = columnar_relation_set_new_filenode,
+#endif
 	.relation_nontransactional_truncate = columnar_relation_nontransactional_truncate,
 	.relation_copy_data = columnar_relation_copy_data,
 	.relation_copy_for_cluster = columnar_relation_copy_for_cluster,
@@ -1062,8 +1130,10 @@ const TableAmRoutine columnar_am_methods = {
 
 	.relation_size = columnar_relation_size,
 	.relation_needs_toast_table = columnar_relation_needs_toast_table,
+#if PG_VERSION_NUM >= 160000
 	.relation_toast_am = NULL,
 	.relation_fetch_toast_slice = NULL,
+#endif
 
 	.relation_estimate_size = columnar_relation_estimate_size,
 

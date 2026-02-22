@@ -2,7 +2,7 @@
 #define COLUMNAR_STORAGE_H
 
 #include "postgres.h"
-#include "storage/relfilelocator.h"
+#include "pg_compat.h"
 
 #include "nanoarrow.h"
 #include "nanoarrow_ipc.h"

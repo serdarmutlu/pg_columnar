@@ -10,6 +10,7 @@
 #include "utils/guc.h"
 #include "utils/syscache.h"
 
+#include "pg_compat.h"
 #include "columnar_storage.h"
 #include "columnar_write_buffer.h"
 
@@ -131,10 +132,10 @@ columnar_object_access_hook(ObjectAccessType access,
 			return;
 		}
 
-		rlocator.spcOid = classform->reltablespace ?
+		PG_LOCATOR_SPC(&rlocator) = classform->reltablespace ?
 			classform->reltablespace : MyDatabaseTableSpace;
-		rlocator.dbOid = MyDatabaseId;
-		rlocator.relNumber = classform->relfilenode;
+		PG_LOCATOR_DB(&rlocator) = MyDatabaseId;
+		PG_LOCATOR_REL(&rlocator) = classform->relfilenode;
 
 		ReleaseSysCache(classtup);
 

@@ -4,6 +4,7 @@
 #include "postgres.h"
 #include "utils/relcache.h"
 
+#include "pg_compat.h"
 #include "nanoarrow.h"
 
 /*
