@@ -6,6 +6,7 @@
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "commands/vacuum.h"
+#include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -63,20 +64,52 @@ typedef struct ColumnarScanDescData
 typedef ColumnarScanDescData *ColumnarScanDesc;
 
 /* ----------------------------------------------------------------
- * Helper: open/close stripe IPC reader
+ * Index fetch descriptor for columnar tables.
+ *
+ * TID encoding used by this TAM:
+ *   BlockNumber  = 1-based stripe index (1 = first on-disk stripe)
+ *   OffsetNumber = 1-based row offset within that stripe
+ *   BlockNumber  = num_stripes + 1 for rows still in the write buffer
+ * ----------------------------------------------------------------
+ */
+typedef struct ColumnarIndexFetchData
+{
+	IndexFetchTableData base;
+
+	/* Currently cached stripe (-1 = nothing cached) */
+	int			cached_stripe_id;
+
+	/* Arrow IPC reader state for the cached stripe */
+	struct ArrowArrayStream arrow_stream;
+	struct ArrowSchema arrow_schema;
+	bool		stream_open;
+
+	/* The single RecordBatch that forms the cached stripe */
+	struct ArrowArray cached_batch;
+	struct ArrowArrayView batch_view;
+	bool		has_batch;
+	bool		batch_view_valid;
+} ColumnarIndexFetchData;
+
+/* ----------------------------------------------------------------
+ * Helper: open a stripe's IPC stream into caller-supplied state.
+ *
+ * Initialises *out_stream and *out_schema from the stripe file.
+ * The caller owns both and must release them when done.
  * ----------------------------------------------------------------
  */
 static void
-columnar_open_stripe(ColumnarScanDesc scan, int stripe_idx)
+columnar_open_stripe_stream(const RelFileLocator *locator,
+							StripeMetadata *sm,
+							struct ArrowArrayStream *out_stream,
+							struct ArrowSchema *out_schema)
 {
-	Relation	rel = scan->base.rs_rd;
-	StripeMetadata *sm = &scan->stripe_meta[stripe_idx];
 	char	   *filepath;
 	FILE	   *fp;
 	struct ArrowIpcInputStream input_stream;
 	int			rc;
 
-	filepath = columnar_stripe_path(RelationGetLocator(rel), sm->stripe_id);
+	filepath = columnar_stripe_path(locator, sm->stripe_id);
 
 	if (sm->compression == COLUMNAR_COMPRESSION_NONE)
 	{
@@ -200,20 +233,30 @@ columnar_open_stripe(ColumnarScanDesc scan, int stripe_idx)
 		}
 	}
 
-	rc = ArrowIpcArrayStreamReaderInit(&scan->arrow_stream, &input_stream, NULL);
+	rc = ArrowIpcArrayStreamReaderInit(out_stream, &input_stream, NULL);
 	if (rc != NANOARROW_OK)
 		ereport(ERROR, (errmsg("columnar: failed to init IPC reader")));
 
 	/* Read schema */
-	rc = scan->arrow_stream.get_schema(&scan->arrow_stream, &scan->arrow_schema);
+	rc = out_stream->get_schema(out_stream, out_schema);
 	if (rc != 0)
 		ereport(ERROR, (errmsg("columnar: failed to read schema from stripe %d",
 							   sm->stripe_id)));
 
+	pfree(filepath);
+}
+
+static void
+columnar_open_stripe(ColumnarScanDesc scan, int stripe_idx)
+{
+	Relation	rel = scan->base.rs_rd;
+	StripeMetadata *sm = &scan->stripe_meta[stripe_idx];
+
+	columnar_open_stripe_stream(RelationGetLocator(rel), sm,
+								&scan->arrow_stream, &scan->arrow_schema);
+
 	scan->stream_open = true;
 	scan->has_batch = false;
-
-	pfree(filepath);
 }
 
 static void
@@ -627,26 +670,65 @@ columnar_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
 }
 
 /* ----------------------------------------------------------------
- * Index fetch stubs
+ * Index fetch implementation
  * ----------------------------------------------------------------
  */
+
+/* Release any cached stripe held by an index fetch descriptor. */
+static void
+columnar_index_release_cached_stripe(ColumnarIndexFetchData *iscan)
+{
+	if (iscan->batch_view_valid)
+	{
+		ArrowArrayViewReset(&iscan->batch_view);
+		iscan->batch_view_valid = false;
+	}
+	if (iscan->has_batch && iscan->cached_batch.release)
+	{
+		iscan->cached_batch.release(&iscan->cached_batch);
+		iscan->has_batch = false;
+	}
+	if (iscan->stream_open)
+	{
+		if (iscan->arrow_schema.release)
+			iscan->arrow_schema.release(&iscan->arrow_schema);
+		if (iscan->arrow_stream.release)
+			iscan->arrow_stream.release(&iscan->arrow_stream);
+		iscan->stream_open = false;
+	}
+	iscan->cached_stripe_id = -1;
+}
+
 static struct IndexFetchTableData *
 columnar_index_fetch_begin(Relation rel)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("columnar tables do not support index scans")));
-	return NULL;
+	ColumnarIndexFetchData *iscan = palloc0(sizeof(ColumnarIndexFetchData));
+
+	iscan->base.rel = rel;
+	iscan->cached_stripe_id = -1;
+	iscan->stream_open = false;
+	iscan->has_batch = false;
+	iscan->batch_view_valid = false;
+
+	return (struct IndexFetchTableData *) iscan;
 }
 
 static void
-columnar_index_fetch_reset(struct IndexFetchTableData *data)
+columnar_index_fetch_reset(struct IndexFetchTableData *scan)
 {
+	/*
+	 * Keep any cached stripe to benefit repeated lookups in the same
+	 * stripe within one index scan.
+	 */
 }
 
 static void
-columnar_index_fetch_end(struct IndexFetchTableData *data)
+columnar_index_fetch_end(struct IndexFetchTableData *scan)
 {
+	ColumnarIndexFetchData *iscan = (ColumnarIndexFetchData *) scan;
+
+	columnar_index_release_cached_stripe(iscan);
+	pfree(iscan);
 }
 
 static bool
@@ -656,10 +738,247 @@ columnar_index_fetch_tuple(struct IndexFetchTableData *scan,
 						   TupleTableSlot *slot,
 						   bool *call_again, bool *all_dead)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("columnar tables do not support index scans")));
-	return false;
+	ColumnarIndexFetchData *iscan = (ColumnarIndexFetchData *) scan;
+	Relation	rel = scan->rel;
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	BlockNumber stripe_1based = ItemPointerGetBlockNumber(tid);
+	OffsetNumber row_off_1based = ItemPointerGetOffsetNumber(tid);
+	int64_t		row_idx = (int64_t) row_off_1based - 1;
+	ColumnarMetadata *meta;
+	int			num_stripes;
+
+	*call_again = false;
+	if (all_dead)
+		*all_dead = false;
+
+	ExecClearTuple(slot);
+
+	meta = columnar_read_metadata(RelationGetLocator(rel));
+	num_stripes = meta->num_stripes;
+
+	/* ---- Write-buffer row ---- */
+	if ((int) stripe_1based == num_stripes + 1)
+	{
+		ColumnarWriteBuffer *wb = columnar_find_write_buffer(rel);
+
+		if (wb == NULL || row_idx < 0 || row_idx >= wb->nrows)
+		{
+			if (meta->stripes)
+				pfree(meta->stripes);
+			pfree(meta);
+			return false;
+		}
+
+		/*
+		 * Populate the slot from the in-progress write buffer using the
+		 * same column-reading pattern as the sequential scan.
+		 */
+		{
+			int			child_idx = 0;
+			int			natts = tupdesc->natts;
+			int			i;
+
+			for (i = 0; i < natts; i++)
+			{
+				Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+
+				if (attr->attisdropped)
+				{
+					slot->tts_isnull[i] = true;
+					slot->tts_values[i] = (Datum) 0;
+					continue;
+				}
+
+				{
+					struct ArrowArrayView col_view;
+					struct ArrowError err;
+					int			rc;
+
+					ArrowArrayViewInitFromSchema(&col_view,
+												 wb->schema.children[child_idx],
+												 &err);
+					rc = ArrowArrayViewSetArray(&col_view,
+											   &wb->columns[i].array,
+											   &err);
+					if (rc != NANOARROW_OK)
+					{
+						slot->tts_isnull[i] = true;
+						slot->tts_values[i] = (Datum) 0;
+						ArrowArrayViewReset(&col_view);
+						child_idx++;
+						continue;
+					}
+
+					if (ArrowArrayViewIsNull(&col_view, row_idx))
+					{
+						slot->tts_isnull[i] = true;
+						slot->tts_values[i] = (Datum) 0;
+					}
+					else
+					{
+						slot->tts_isnull[i] = false;
+
+						switch (attr->atttypid)
+						{
+							case BOOLOID:
+								slot->tts_values[i] = BoolGetDatum(
+									ArrowArrayViewGetIntUnsafe(&col_view, row_idx) != 0);
+								break;
+							case INT2OID:
+								slot->tts_values[i] = Int16GetDatum(
+									(int16) ArrowArrayViewGetIntUnsafe(&col_view, row_idx));
+								break;
+							case INT4OID:
+								slot->tts_values[i] = Int32GetDatum(
+									(int32) ArrowArrayViewGetIntUnsafe(&col_view, row_idx));
+								break;
+							case INT8OID:
+								slot->tts_values[i] = Int64GetDatum(
+									ArrowArrayViewGetIntUnsafe(&col_view, row_idx));
+								break;
+							case FLOAT4OID:
+								slot->tts_values[i] = Float4GetDatum(
+									(float4) ArrowArrayViewGetDoubleUnsafe(&col_view, row_idx));
+								break;
+							case FLOAT8OID:
+								slot->tts_values[i] = Float8GetDatum(
+									ArrowArrayViewGetDoubleUnsafe(&col_view, row_idx));
+								break;
+							case TEXTOID:
+							case VARCHAROID:
+							{
+								struct ArrowStringView sv =
+									ArrowArrayViewGetStringUnsafe(&col_view, row_idx);
+								text   *t = (text *) palloc(VARHDRSZ + sv.size_bytes);
+
+								SET_VARSIZE(t, VARHDRSZ + sv.size_bytes);
+								memcpy(VARDATA(t), sv.data, sv.size_bytes);
+								slot->tts_values[i] = PointerGetDatum(t);
+								break;
+							}
+							case BYTEAOID:
+							{
+								struct ArrowBufferView bv =
+									ArrowArrayViewGetBytesUnsafe(&col_view, row_idx);
+								bytea  *b = (bytea *) palloc(VARHDRSZ + bv.size_bytes);
+
+								SET_VARSIZE(b, VARHDRSZ + bv.size_bytes);
+								memcpy(VARDATA(b), bv.data.data, bv.size_bytes);
+								slot->tts_values[i] = PointerGetDatum(b);
+								break;
+							}
+							case DATEOID:
+							{
+								int32_t arrow_date = (int32_t)
+									ArrowArrayViewGetIntUnsafe(&col_view, row_idx);
+
+								slot->tts_values[i] = DateADTGetDatum(
+									(DateADT)(arrow_date - 10957));
+								break;
+							}
+							case TIMESTAMPOID:
+							case TIMESTAMPTZOID:
+							{
+								int64_t arrow_ts =
+									ArrowArrayViewGetIntUnsafe(&col_view, row_idx);
+
+								slot->tts_values[i] = TimestampGetDatum(
+									(Timestamp)(arrow_ts - INT64CONST(946684800000000)));
+								break;
+							}
+							default:
+								slot->tts_isnull[i] = true;
+								slot->tts_values[i] = (Datum) 0;
+								break;
+						}
+					}
+					ArrowArrayViewReset(&col_view);
+				}
+				child_idx++;
+			}
+		}
+
+		ItemPointerCopy(tid, &slot->tts_tid);
+		ExecStoreVirtualTuple(slot);
+
+		if (meta->stripes)
+			pfree(meta->stripes);
+		pfree(meta);
+		return true;
+	}
+
+	/* ---- On-disk stripe row ---- */
+	if ((int) stripe_1based < 1 || (int) stripe_1based > num_stripes)
+	{
+		/* TID out of range */
+		if (meta->stripes)
+			pfree(meta->stripes);
+		pfree(meta);
+		return false;
+	}
+
+	/* Load the stripe into cache if it is not already there */
+	if (iscan->cached_stripe_id != (int) stripe_1based)
+	{
+		StripeMetadata *sm = &meta->stripes[stripe_1based - 1];
+		struct ArrowError arrow_error;
+		int			rc;
+
+		/* Drop any previously cached stripe */
+		columnar_index_release_cached_stripe(iscan);
+
+		/* Open the IPC stream for this stripe */
+		columnar_open_stripe_stream(RelationGetLocator(rel), sm,
+									&iscan->arrow_stream,
+									&iscan->arrow_schema);
+		iscan->stream_open = true;
+
+		/*
+		 * Each stripe is written as a single RecordBatch.  Read it now so
+		 * that subsequent lookups in the same stripe are served from RAM.
+		 */
+		memset(&iscan->cached_batch, 0, sizeof(iscan->cached_batch));
+		rc = iscan->arrow_stream.get_next(&iscan->arrow_stream,
+										  &iscan->cached_batch);
+		if (rc != 0 || iscan->cached_batch.release == NULL)
+		{
+			/* Empty stripe — nothing to fetch */
+			if (meta->stripes)
+				pfree(meta->stripes);
+			pfree(meta);
+			return false;
+		}
+		iscan->has_batch = true;
+
+		/* Build the array view for typed column access */
+		ArrowArrayViewInitFromSchema(&iscan->batch_view,
+									 &iscan->arrow_schema,
+									 &arrow_error);
+		rc = ArrowArrayViewSetArray(&iscan->batch_view,
+									&iscan->cached_batch,
+									&arrow_error);
+		if (rc != NANOARROW_OK)
+			ereport(ERROR,
+					(errmsg("columnar: failed to set index fetch batch view: %s",
+							arrow_error.message)));
+		iscan->batch_view_valid = true;
+		iscan->cached_stripe_id = (int) stripe_1based;
+	}
+
+	if (meta->stripes)
+		pfree(meta->stripes);
+	pfree(meta);
+
+	/* Validate that the row offset is within the cached batch */
+	if (row_idx < 0 || row_idx >= iscan->cached_batch.length)
+		return false;
+
+	/* Populate the slot from the cached batch */
+	columnar_populate_slot(slot, &iscan->batch_view, row_idx, tupdesc);
+	ItemPointerCopy(tid, &slot->tts_tid);
+	ExecStoreVirtualTuple(slot);
+
+	return true;
 }
 
 /* ----------------------------------------------------------------
@@ -702,9 +1021,11 @@ columnar_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 static TransactionId
 columnar_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("columnar tables do not support index deletion")));
+	/*
+	 * Columnar tables do not support DELETE or UPDATE, so no tuples can
+	 * ever become dead.  Return InvalidTransactionId to indicate there
+	 * are no deletable index entries.
+	 */
 	return InvalidTransactionId;
 }
 #else
@@ -714,9 +1035,6 @@ columnar_index_delete_tuples(Relation rel, TM_IndexDelete *delstate,
 							 int nstatus, TransactionId oldestXmin,
 							 bool knowndead)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("columnar tables do not support index deletion")));
 	return InvalidTransactionId;
 }
 #endif
@@ -761,8 +1079,15 @@ columnar_tuple_insert(Relation rel, TupleTableSlot *slot,
 	buf->nrows++;
 
 
-	/* Synthesize a TID */
-	ItemPointerSet(&slot->tts_tid, 0, (OffsetNumber) buf->nrows);
+	/*
+	 * Synthesize a TID that matches where this row will land once the
+	 * write buffer is flushed to disk.  wb_stripe_block tracks the
+	 * 1-based stripe index that the current write batch will become,
+	 * so the TID is (wb_stripe_block, row_offset_within_batch).
+	 */
+	ItemPointerSet(&slot->tts_tid,
+				   (BlockNumber) buf->wb_stripe_block,
+				   (OffsetNumber) buf->nrows);
 
 
 	/* Auto-flush when buffer is full */
@@ -873,7 +1198,7 @@ columnar_finish_bulk_insert(Relation rel, int options)
  * DDL callbacks
  * ----------------------------------------------------------------
  */
-#if PG_VERSION_NUM >= 170000
+#if PG_VERSION_NUM >= 160000
 static void
 columnar_relation_set_new_filelocator(Relation rel,
 									  const RelFileLocator *newrlocator,
@@ -908,7 +1233,7 @@ columnar_relation_nontransactional_truncate(Relation rel)
 	columnar_create_storage(RelationGetLocator(rel));
 }
 
-#if PG_VERSION_NUM >= 170000
+#if PG_VERSION_NUM >= 160000
 static void
 columnar_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 {
@@ -958,6 +1283,13 @@ columnar_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream)
 {
 	return false;
 }
+#elif PG_VERSION_NUM >= 160000
+static bool
+columnar_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
+								 BufferAccessStrategy bstrategy)
+{
+	return false;
+}
 #else
 static bool
 columnar_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno)
@@ -976,7 +1308,11 @@ columnar_scan_analyze_next_tuple(TableScanDesc scan,
 }
 
 /* ----------------------------------------------------------------
- * Index build stubs
+ * Index build
+ *
+ * Performs a full sequential scan of the columnar table and calls the
+ * supplied callback for each row with its synthesised TID and index-key
+ * values.  This is the entry-point used by CREATE INDEX.
  * ----------------------------------------------------------------
  */
 static double
@@ -989,21 +1325,79 @@ columnar_index_build_range_scan(Relation table_rel, Relation index_rel,
 								void *callback_state,
 								TableScanDesc scan)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("columnar tables do not support index creation")));
-	return 0;
+	TupleTableSlot *slot;
+	EState	   *estate;
+	ExprContext *econtext;
+	double		ntuples = 0;
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	bool		own_scan = false;
+
+	/*
+	 * If no scan was provided by the caller (the common case for a
+	 * non-concurrent index build), create one over the entire table.
+	 */
+	if (scan == NULL)
+	{
+		scan = columnar_scan_begin(table_rel,
+								  SnapshotAny,
+								  0, NULL, NULL,
+								  SO_TYPE_SEQSCAN);
+		own_scan = true;
+	}
+
+	slot = table_slot_create(table_rel, NULL);
+
+	/*
+	 * An EState is needed so that FormIndexDatum can evaluate index
+	 * expressions and partial-index predicates.
+	 */
+	estate = CreateExecutorState();
+	econtext = GetPerTupleExprContext(estate);
+	econtext->ecxt_scantuple = slot;
+
+	while (columnar_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		CHECK_FOR_INTERRUPTS();
+
+		/* Compute index key values (handles expressions too). */
+		FormIndexDatum(index_info, slot, estate, values, isnull);
+
+		/*
+		 * All columnar rows are treated as live (tupleIsAlive = true)
+		 * because columnar tables have no MVCC and no DELETE support.
+		 */
+		callback(index_rel, &slot->tts_tid, values, isnull,
+				 true /* tupleIsAlive */, callback_state);
+
+		ntuples += 1;
+	}
+
+	ExecDropSingleTupleTableSlot(slot);
+	FreeExecutorState(estate);
+
+	if (own_scan)
+		columnar_scan_end(scan);
+
+	return ntuples;
 }
 
+/* ----------------------------------------------------------------
+ * Index validate scan
+ *
+ * Called during REINDEX CONCURRENTLY to validate newly-inserted index
+ * entries against the visible table contents.  Since columnar tables
+ * have no MVCC and do not support DELETE/UPDATE, every tuple that
+ * existed at initial scan time remains valid — nothing to validate.
+ * ----------------------------------------------------------------
+ */
 static void
 columnar_index_validate_scan(Relation table_rel, Relation index_rel,
 							 struct IndexInfo *index_info,
 							 Snapshot snapshot,
 							 struct ValidateIndexState *state)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("columnar tables do not support index validation")));
+	/* No-op: all tuples are always live in a columnar table. */
 }
 
 /* ----------------------------------------------------------------
@@ -1112,7 +1506,7 @@ const TableAmRoutine columnar_am_methods = {
 	.tuple_lock = columnar_tuple_lock,
 	.finish_bulk_insert = columnar_finish_bulk_insert,
 
-#if PG_VERSION_NUM >= 170000
+#if PG_VERSION_NUM >= 160000
 	.relation_set_new_filelocator = columnar_relation_set_new_filelocator,
 #else
 	.relation_set_new_filenode = columnar_relation_set_new_filenode,
