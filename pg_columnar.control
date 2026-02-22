@@ -1,0 +1,4 @@
+comment = 'Columnar storage using Apache Arrow IPC format'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_columnar'
+relocatable = true
