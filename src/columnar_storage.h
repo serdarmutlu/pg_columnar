@@ -94,4 +94,48 @@ extern void columnar_write_stripe(const RelFileLocator *locator,
  */
 extern uint64 columnar_storage_size(const RelFileLocator *locator);
 
+/* ----------------------------------------------------------------
+ * Delete bitmap API
+ *
+ * Each stripe that has at least one deleted row gets a companion file:
+ *   $PGDATA/columnar/<dbOid>/<relfilenode>/stripe_XXXXXX.deleted
+ *
+ * The file is a packed bitset of ceil(row_count / 8) bytes.
+ * Bit i (0-based) set means row i in that stripe is logically deleted.
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * Build the path for a stripe's delete bitmap file.
+ * Returns a palloc'd string.
+ */
+extern char *columnar_deleted_path(const RelFileLocator *locator, int stripe_id);
+
+/*
+ * Read the delete bitmap for a stripe.
+ * Returns a palloc'd byte array of ceil(row_count/8) bytes, or NULL if the
+ * stripe has no deletions (file does not exist).
+ */
+extern uint8_t *columnar_read_delete_bitmap(const RelFileLocator *locator,
+											int stripe_id, int64_t row_count);
+
+/*
+ * Mark a single row as deleted in the stripe's bitmap file.
+ * Reads the existing file (if any), sets the bit, then rewrites the file.
+ */
+extern void columnar_set_deleted_bit(const RelFileLocator *locator,
+									 int stripe_id,
+									 int64_t row_offset,
+									 int64_t row_count);
+
+/*
+ * Inline helper: test whether bit row_offset is set in the bitmap.
+ * bits must be non-NULL.
+ */
+static inline bool
+columnar_is_deleted(const uint8_t *bits, int64_t row_offset)
+{
+	return (bits[row_offset / 8] & (1 << (row_offset % 8))) != 0;
+}
+
 #endif /* COLUMNAR_STORAGE_H */

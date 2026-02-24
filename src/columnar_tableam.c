@@ -59,6 +59,13 @@ typedef struct ColumnarScanDescData
 	/* Write buffer scan */
 	bool		include_write_buffer;
 	int64_t		wb_row_index;
+
+	/*
+	 * Delete bitmap for the currently open stripe.
+	 * NULL means no rows are deleted in this stripe.
+	 * Allocated in CurrentMemoryContext; freed in columnar_close_stripe.
+	 */
+	uint8_t    *current_delete_bitmap;
 } ColumnarScanDescData;
 
 typedef ColumnarScanDescData *ColumnarScanDesc;
@@ -89,6 +96,12 @@ typedef struct ColumnarIndexFetchData
 	struct ArrowArrayView batch_view;
 	bool		has_batch;
 	bool		batch_view_valid;
+
+	/*
+	 * Delete bitmap for the currently cached stripe.
+	 * NULL means no rows in this stripe are deleted.
+	 */
+	uint8_t    *cached_delete_bitmap;
 } ColumnarIndexFetchData;
 
 /* ----------------------------------------------------------------
@@ -255,6 +268,16 @@ columnar_open_stripe(ColumnarScanDesc scan, int stripe_idx)
 	columnar_open_stripe_stream(RelationGetLocator(rel), sm,
 								&scan->arrow_stream, &scan->arrow_schema);
 
+	/* Load delete bitmap for this stripe (NULL if no rows deleted) */
+	if (scan->current_delete_bitmap)
+	{
+		pfree(scan->current_delete_bitmap);
+		scan->current_delete_bitmap = NULL;
+	}
+	scan->current_delete_bitmap =
+		columnar_read_delete_bitmap(RelationGetLocator(rel),
+									sm->stripe_id, sm->row_count);
+
 	scan->stream_open = true;
 	scan->has_batch = false;
 }
@@ -262,6 +285,12 @@ columnar_open_stripe(ColumnarScanDesc scan, int stripe_idx)
 static void
 columnar_close_stripe(ColumnarScanDesc scan)
 {
+	if (scan->current_delete_bitmap)
+	{
+		pfree(scan->current_delete_bitmap);
+		scan->current_delete_bitmap = NULL;
+	}
+
 	if (scan->has_batch)
 	{
 		if (scan->batch_view_valid)
@@ -410,6 +439,15 @@ columnar_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
 		/* Try to return a row from the current batch */
 		if (scan->has_batch && scan->batch_row_index < scan->batch_length)
 		{
+			/* Skip rows that have been logically deleted */
+			if (scan->current_delete_bitmap != NULL &&
+				columnar_is_deleted(scan->current_delete_bitmap,
+									scan->batch_row_index))
+			{
+				scan->batch_row_index++;
+				continue;
+			}
+
 			columnar_populate_slot(slot, &scan->batch_view,
 								   scan->batch_row_index, tupdesc);
 
@@ -683,6 +721,11 @@ columnar_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
 static void
 columnar_index_release_cached_stripe(ColumnarIndexFetchData *iscan)
 {
+	if (iscan->cached_delete_bitmap)
+	{
+		pfree(iscan->cached_delete_bitmap);
+		iscan->cached_delete_bitmap = NULL;
+	}
 	if (iscan->batch_view_valid)
 	{
 		ArrowArrayViewReset(&iscan->batch_view);
@@ -714,6 +757,7 @@ columnar_index_fetch_begin(Relation rel)
 	iscan->stream_open = false;
 	iscan->has_batch = false;
 	iscan->batch_view_valid = false;
+	iscan->cached_delete_bitmap = NULL;
 
 	return (struct IndexFetchTableData *) iscan;
 }
@@ -967,6 +1011,12 @@ columnar_index_fetch_tuple(struct IndexFetchTableData *scan,
 					(errmsg("columnar: failed to set index fetch batch view: %s",
 							arrow_error.message)));
 		iscan->batch_view_valid = true;
+
+		/* Load the delete bitmap for this stripe (NULL if no deletions) */
+		iscan->cached_delete_bitmap =
+			columnar_read_delete_bitmap(RelationGetLocator(rel),
+										sm->stripe_id, sm->row_count);
+
 		iscan->cached_stripe_id = (int) stripe_1based;
 	}
 
@@ -976,6 +1026,11 @@ columnar_index_fetch_tuple(struct IndexFetchTableData *scan,
 
 	/* Validate that the row offset is within the cached batch */
 	if (row_idx < 0 || row_idx >= iscan->cached_batch.length)
+		return false;
+
+	/* Skip logically deleted rows */
+	if (iscan->cached_delete_bitmap != NULL &&
+		columnar_is_deleted(iscan->cached_delete_bitmap, row_idx))
 		return false;
 
 	/* Populate the slot from the cached batch */
@@ -994,10 +1049,20 @@ static bool
 columnar_tuple_fetch_row_version(Relation rel, ItemPointer tid,
 								 Snapshot snapshot, TupleTableSlot *slot)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("columnar tables do not support tuple fetch by TID")));
-	return false;
+	struct IndexFetchTableData *iscan;
+	bool		call_again = false;
+	bool		all_dead = false;
+	bool		found;
+
+	/*
+	 * Reuse the index fetch path, which already handles both on-disk
+	 * stripe rows and write-buffer rows, and respects the delete bitmap.
+	 */
+	iscan = columnar_index_fetch_begin(rel);
+	found = columnar_index_fetch_tuple(iscan, tid, snapshot, slot,
+									   &call_again, &all_dead);
+	columnar_index_fetch_end(iscan);
+	return found;
 }
 
 static bool
@@ -1141,9 +1206,51 @@ columnar_tuple_delete(Relation rel, ItemPointer tid,
 					  Snapshot crosscheck, bool wait,
 					  TM_FailureData *tmfd, bool changingPart)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("columnar tables do not support DELETE")));
+	BlockNumber stripe_1based = ItemPointerGetBlockNumber(tid);
+	OffsetNumber row_off_1based = ItemPointerGetOffsetNumber(tid);
+	int64_t		row_idx = (int64_t) row_off_1based - 1;
+	ColumnarMetadata *meta;
+	int			num_stripes;
+
+	memset(tmfd, 0, sizeof(*tmfd));
+
+	meta = columnar_read_metadata(RelationGetLocator(rel));
+	num_stripes = meta->num_stripes;
+
+	if ((int) stripe_1based == num_stripes + 1)
+	{
+		/*
+		 * The target row is in the write buffer (not yet on disk).
+		 * Flush the write buffer first so the row becomes part of an
+		 * on-disk stripe with the same stripe ID as its TID block number.
+		 * After the flush the stripe_1based value is valid on disk.
+		 */
+		ColumnarWriteBuffer *wb = columnar_find_write_buffer(rel);
+
+		if (wb != NULL && wb->nrows > 0)
+			columnar_flush_write_buffer(wb);
+
+		/* Re-read metadata now that the stripe is on disk */
+		if (meta->stripes)
+			pfree(meta->stripes);
+		pfree(meta);
+		meta = columnar_read_metadata(RelationGetLocator(rel));
+		num_stripes = meta->num_stripes;
+	}
+
+	/* Mark the row deleted in the on-disk stripe's bitmap */
+	if ((int) stripe_1based >= 1 && (int) stripe_1based <= num_stripes)
+	{
+		StripeMetadata *sm = &meta->stripes[stripe_1based - 1];
+
+		columnar_set_deleted_bit(RelationGetLocator(rel),
+								 sm->stripe_id, row_idx, sm->row_count);
+	}
+
+	if (meta->stripes)
+		pfree(meta->stripes);
+	pfree(meta);
+
 	return TM_Ok;
 }
 
@@ -1156,9 +1263,28 @@ columnar_tuple_update(Relation rel, ItemPointer otid,
 					  LockTupleMode *lockmode,
 					  TU_UpdateIndexes *update_indexes)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("columnar tables do not support UPDATE")));
+	TM_FailureData del_tmfd;
+	TM_Result	result;
+
+	memset(tmfd, 0, sizeof(*tmfd));
+	if (lockmode)
+		*lockmode = LockTupleExclusive;
+
+	/* Step 1: logically delete the old row */
+	result = columnar_tuple_delete(rel, otid, cid, snapshot, crosscheck,
+								   wait, &del_tmfd, false);
+	if (result != TM_Ok)
+	{
+		*tmfd = del_tmfd;
+		return result;
+	}
+
+	/* Step 2: insert the new row; slot->tts_tid gets the new TID */
+	columnar_tuple_insert(rel, slot, cid, 0, NULL);
+
+	/* Tell the executor to update all index entries for this row */
+	*update_indexes = TU_All;
+
 	return TM_Ok;
 }
 #else
@@ -1170,9 +1296,28 @@ columnar_tuple_update(Relation rel, ItemPointer otid,
 					  LockTupleMode *lockmode,
 					  bool *update_indexes)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("columnar tables do not support UPDATE")));
+	TM_FailureData del_tmfd;
+	TM_Result	result;
+
+	memset(tmfd, 0, sizeof(*tmfd));
+	if (lockmode)
+		*lockmode = LockTupleExclusive;
+
+	/* Step 1: logically delete the old row */
+	result = columnar_tuple_delete(rel, otid, cid, snapshot, crosscheck,
+								   wait, &del_tmfd, false);
+	if (result != TM_Ok)
+	{
+		*tmfd = del_tmfd;
+		return result;
+	}
+
+	/* Step 2: insert the new row; slot->tts_tid gets the new TID */
+	columnar_tuple_insert(rel, slot, cid, 0, NULL);
+
+	/* Tell the executor to update all index entries for this row */
+	*update_indexes = true;
+
 	return TM_Ok;
 }
 #endif
@@ -1184,9 +1329,19 @@ columnar_tuple_lock(Relation rel, ItemPointer tid,
 					LockWaitPolicy wait_policy, uint8 flags,
 					TM_FailureData *tmfd)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("columnar tables do not support row locking")));
+	memset(tmfd, 0, sizeof(*tmfd));
+
+	/*
+	 * Columnar tables have no MVCC and no row-level locking.
+	 * Populate the slot with the current row version so the caller
+	 * (e.g. the UPDATE executor) can compute the new tuple.
+	 */
+	if (!columnar_tuple_fetch_row_version(rel, tid, snapshot, slot))
+	{
+		/* Row was already deleted */
+		return TM_Deleted;
+	}
+
 	return TM_Ok;
 }
 

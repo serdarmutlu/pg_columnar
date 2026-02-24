@@ -420,6 +420,102 @@ columnar_write_stripe(const RelFileLocator *locator,
 	pfree(filepath);
 }
 
+/* ----------------------------------------------------------------
+ * Delete bitmap implementation
+ * ----------------------------------------------------------------
+ */
+
+char *
+columnar_deleted_path(const RelFileLocator *locator, int stripe_id)
+{
+	char	   *path = palloc(MAXPGPATH);
+
+	snprintf(path, MAXPGPATH, "%s/columnar/%u/%u/stripe_%06d.deleted",
+			 DataDir, PG_LOCATOR_DB(locator), PG_LOCATOR_REL(locator),
+			 stripe_id);
+	return path;
+}
+
+uint8_t *
+columnar_read_delete_bitmap(const RelFileLocator *locator,
+							int stripe_id, int64_t row_count)
+{
+	char	   *path = columnar_deleted_path(locator, stripe_id);
+	FILE	   *fp;
+	int64_t		nbytes = (row_count + 7) / 8;
+	uint8_t    *bits;
+
+	fp = fopen(path, "rb");
+	pfree(path);
+
+	if (fp == NULL)
+		return NULL;			/* no deletions for this stripe */
+
+	bits = palloc0(nbytes);
+	(void) fread(bits, 1, nbytes, fp);
+	fclose(fp);
+	return bits;
+}
+
+void
+columnar_set_deleted_bit(const RelFileLocator *locator,
+						 int stripe_id,
+						 int64_t row_offset,
+						 int64_t row_count)
+{
+	char	   *path = columnar_deleted_path(locator, stripe_id);
+	int64_t		nbytes = (row_count + 7) / 8;
+	uint8_t    *bits;
+	FILE	   *fp;
+
+	/* Read existing bitmap or allocate a fresh zeroed one */
+	fp = fopen(path, "rb");
+	if (fp != NULL)
+	{
+		bits = palloc0(nbytes);
+		(void) fread(bits, 1, nbytes, fp);
+		fclose(fp);
+	}
+	else
+	{
+		bits = palloc0(nbytes);
+	}
+
+	/* Set the bit for this row */
+	bits[row_offset / 8] |= (uint8_t) (1 << (row_offset % 8));
+
+	/* Write the updated bitmap back */
+	fp = fopen(path, "wb");
+	if (fp == NULL)
+	{
+		char	   *errmsg_path = pstrdup(path);
+
+		pfree(bits);
+		pfree(path);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write delete bitmap \"%s\": %m",
+						errmsg_path)));
+	}
+
+	if (fwrite(bits, 1, nbytes, fp) != (size_t) nbytes)
+	{
+		char	   *errmsg_path = pstrdup(path);
+
+		fclose(fp);
+		pfree(bits);
+		pfree(path);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write delete bitmap \"%s\": %m",
+						errmsg_path)));
+	}
+
+	fclose(fp);
+	pfree(bits);
+	pfree(path);
+}
+
 uint64
 columnar_storage_size(const RelFileLocator *locator)
 {
