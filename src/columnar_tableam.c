@@ -1748,12 +1748,14 @@ columnar_relation_vacuum(Relation rel, struct VacuumParams *params,
 			pfree(stats_path);
 
 			/*
-			 * Evict the stats cache entry for this stripe so that
-			 * subsequent scans do not find stale data in memory.
-			 * (The entry is safe to leave — row_count=0 prevents it from
-			 * being accessed — but evicting keeps memory clean.)
+			 * Evict both the stats cache and the bitmap cache for this
+			 * stripe.  Their files have been removed from disk, and the
+			 * stripe's row_count is about to be zeroed.  Evicting keeps
+			 * memory clean and removes any file_absent marker that a
+			 * future table reusing the same relfilenode might inherit.
 			 */
 			columnar_stats_cache_evict_stripe(locator, sm->stripe_id);
+			columnar_bitmap_cache_evict_stripe(locator, sm->stripe_id);
 
 			sm->row_count = 0;
 			sm->file_size = 0;

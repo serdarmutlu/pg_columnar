@@ -209,6 +209,63 @@ be silently skipped — no stale stats are used for the schema-mismatched stripe
 **Net effect:** for a table with N stripes, `columnar_stripe_should_skip` goes from
 N `fopen` + parse calls per scan to zero file I/O after the first scan warms the cache.
 
+### Level 3c — Delete Bitmap In-memory Cache (implemented)
+
+`columnar_read_delete_bitmap` previously opened and read the `.deleted` file from disk
+on every stripe open — one `fopen` + `fread` per stripe for sequential scans, index
+fetches, and VACUUM. `columnar_set_deleted_bit` performed a full **read-modify-write**
+cycle on the `.deleted` file for every deleted row (one `fopen`+`fread` to load the
+current bitmap, then `fopen`+`fwrite` to persist the updated bitmap).
+
+The key difference from the stats cache: delete bitmaps are **mutable** — they are
+updated by every `DELETE` and `UPDATE` operation. The cache is therefore kept in sync
+after every write, not just after the initial read.
+
+**Cache key:** `(dbOid, relNumber, stripe_id)` — same three-field key as the stats cache.
+
+**Cache storage:** backend-local `HTAB` (`bitmap_cache`) in a dedicated
+`MemoryContext` (`bitmap_cache_ctx`) rooted at `TopMemoryContext`. The `bits[]` byte
+array inside each entry is palloc'd in `bitmap_cache_ctx` so it outlives individual
+queries.
+
+**Hit path (read):** `columnar_read_delete_bitmap` returns a `palloc`'d copy of the
+cached bitmap in `CurrentMemoryContext`; zero file I/O.
+
+**`file_absent` marker:** when `fopen` fails with `ENOENT` (no rows have been deleted
+from this stripe yet), a cache entry is recorded with `file_absent = true`. Subsequent
+calls return `NULL` immediately without attempting another `fopen`. This is particularly
+valuable for tables where most stripes are never touched by DELETE.
+
+**Update-after-write discipline:** `columnar_set_deleted_bit` updates the cache
+**after** the `fwrite` succeeds. This ensures the cache only ever reflects durably
+persisted bitmap state — a failed write leaves the cache unchanged and the on-disk
+file is the authoritative source.
+
+**DELETE optimization bonus:** beyond scan read-caching, the bitmap cache also
+eliminates the *read* half of `columnar_set_deleted_bit`'s read-modify-write cycle.
+For a session that deletes many rows from the same stripe, the first DELETE reads
+from disk (cache miss), subsequent DELETEs in that session read from the cache.
+
+**Update points:**
+- `columnar_set_deleted_bit` — updates cache after every successful `fwrite`.
+- `columnar_read_delete_bitmap` (cache-miss path) — populates after a successful
+  `fread`, or records `file_absent = true` after a confirmed `ENOENT`.
+
+**Eviction:**
+- `columnar_bitmap_cache_evict_stripe(locator, stripe_id)` — evicts a single stripe
+  entry. Declared `extern` in `columnar_storage.h`; called from
+  `columnar_relation_vacuum` after the `.deleted` file is unlinked for a
+  fully-deleted stripe (alongside `columnar_stats_cache_evict_stripe`).
+- `columnar_bitmap_cache_evict_relation(locator)` — evicts all entries for a relation
+  (static, called from `columnar_remove_storage` on DROP TABLE / TRUNCATE). Uses the
+  same collect-then-delete loop as the stats cache.
+
+**Net effect:**
+- Sequential and index scans: zero `.deleted` file I/O after the first scan warms
+  the cache for each stripe.
+- DELETE-heavy workloads: only the first DELETE per stripe per session hits disk for
+  the read; all subsequent DELETEs in the same session skip the read entirely.
+
 ### Level 4 — Columnar Buffer Pool (planned)
 
 Custom scan node + shared stripe RecordBatch cache.  Supersedes Level 2 (shared stripe

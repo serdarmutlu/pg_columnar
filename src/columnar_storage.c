@@ -387,6 +387,223 @@ columnar_stats_cache_evict_relation(const RelFileLocator *locator)
 	pfree(keys);
 }
 
+/* ----------------------------------------------------------------
+ * Backend-local delete-bitmap cache
+ *
+ * Each stripe that has at least one deleted row gets a companion
+ * .deleted file (a packed bitset).  Before this cache, every seq-scan
+ * stripe open, every index-fetch stripe load, every VACUUM pass, and
+ * every DELETE operation incurred at least one fopen+fread.
+ *
+ * Unlike stats (.stats files are write-once), delete bitmaps are
+ * mutable: every DELETE/UPDATE modifies the bitmap via
+ * columnar_set_deleted_bit().  The cache is therefore updated after
+ * every successful write, not just after the initial read.
+ *
+ * Key:   (dbOid, relNumber, stripe_id)
+ * Value: copy of the bitmap bytes, or a "file absent" marker.
+ *
+ * "file absent" (file_absent=true) means no .deleted file exists for
+ * this stripe — i.e. no rows have been deleted yet.  This avoids
+ * repeated fopen() failures on clean stripes.
+ *
+ * Cross-backend staleness: intentionally not handled — matches the
+ * no-MVCC stance of the entire TAM.
+ *
+ * Invalidation rules:
+ *   columnar_bitmap_cache_evict_stripe() — called from VACUUM when a
+ *   fully-deleted stripe's .deleted file is removed.
+ *
+ *   columnar_bitmap_cache_evict_relation() — called from
+ *   columnar_remove_storage() on DROP TABLE / TRUNCATE.
+ * ----------------------------------------------------------------
+ */
+
+typedef struct ColumnarBitmapCacheKey
+{
+	Oid			dbOid;
+	Oid			relNumber;
+	int			stripe_id;
+	/* 3 × 4 bytes = 12 bytes, naturally aligned — no padding */
+} ColumnarBitmapCacheKey;
+
+typedef struct ColumnarBitmapCacheEntry
+{
+	ColumnarBitmapCacheKey key;		/* MUST be first for HTAB */
+	bool		file_absent;		/* true = no .deleted file (stripe has no deletions) */
+	int64_t		nbytes;				/* byte count of bits[]; 0 if file_absent */
+	uint8_t    *bits;				/* palloc'd in bitmap_cache_ctx; NULL if file_absent */
+} ColumnarBitmapCacheEntry;
+
+static HTAB *bitmap_cache = NULL;
+static MemoryContext bitmap_cache_ctx = NULL;
+
+/*
+ * Initialise the bitmap cache lazily on first use.
+ */
+static void
+columnar_bitmap_cache_init(void)
+{
+	HASHCTL		ctl;
+
+	bitmap_cache_ctx = AllocSetContextCreate(TopMemoryContext,
+											 "columnar bitmap cache",
+											 ALLOCSET_SMALL_SIZES);
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(ColumnarBitmapCacheKey);
+	ctl.entrysize = sizeof(ColumnarBitmapCacheEntry);
+	ctl.hcxt = bitmap_cache_ctx;
+
+	bitmap_cache = hash_create("columnar bitmap cache",
+							   64,	/* initial buckets; grows automatically */
+							   &ctl,
+							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+/*
+ * Insert or overwrite a bitmap cache entry.
+ *
+ * Pass bits=NULL / nbytes=0 to record that the .deleted file is absent
+ * for this stripe (stripe has no deletions yet).
+ * Pass a valid bits pointer to cache the current bitmap contents.
+ *
+ * The cache is updated after every successful file read (cache-miss
+ * path) and after every successful file write (columnar_set_deleted_bit).
+ * This "update after write" discipline ensures we only cache data that
+ * is safely on disk.
+ */
+static void
+columnar_bitmap_cache_update(const RelFileLocator *locator,
+							 int stripe_id,
+							 const uint8_t *bits,
+							 int64_t nbytes)
+{
+	ColumnarBitmapCacheKey key;
+	ColumnarBitmapCacheEntry *entry;
+	bool		found;
+	MemoryContext oldcxt;
+
+	if (bitmap_cache == NULL)
+		columnar_bitmap_cache_init();
+
+	memset(&key, 0, sizeof(key));
+	key.dbOid = (Oid) PG_LOCATOR_DB(locator);
+	key.relNumber = (Oid) PG_LOCATOR_REL(locator);
+	key.stripe_id = stripe_id;
+
+	entry = hash_search(bitmap_cache, &key, HASH_ENTER, &found);
+
+	/* Free the old bits array when overwriting an existing entry */
+	if (found && entry->bits != NULL)
+	{
+		pfree(entry->bits);
+		entry->bits = NULL;
+	}
+
+	if (bits == NULL || nbytes == 0)
+	{
+		/* Record that the file is absent (stripe has no deletions) */
+		entry->file_absent = true;
+		entry->nbytes = 0;
+		entry->bits = NULL;
+		return;
+	}
+
+	entry->file_absent = false;
+	entry->nbytes = nbytes;
+
+	oldcxt = MemoryContextSwitchTo(bitmap_cache_ctx);
+	entry->bits = palloc(nbytes);
+	MemoryContextSwitchTo(oldcxt);
+	memcpy(entry->bits, bits, nbytes);
+}
+
+/*
+ * Evict the bitmap cache entry for a single stripe.
+ *
+ * Called from columnar_relation_vacuum() when a fully-deleted stripe's
+ * .deleted file is removed from disk.  Declared extern so
+ * columnar_tableam.c can call it alongside the stats cache eviction.
+ */
+void
+columnar_bitmap_cache_evict_stripe(const RelFileLocator *locator, int stripe_id)
+{
+	ColumnarBitmapCacheKey key;
+	ColumnarBitmapCacheEntry *entry;
+	bool		found;
+
+	if (bitmap_cache == NULL)
+		return;
+
+	memset(&key, 0, sizeof(key));
+	key.dbOid = (Oid) PG_LOCATOR_DB(locator);
+	key.relNumber = (Oid) PG_LOCATOR_REL(locator);
+	key.stripe_id = stripe_id;
+
+	entry = hash_search(bitmap_cache, &key, HASH_FIND, &found);
+	if (found && entry->bits != NULL)
+	{
+		pfree(entry->bits);
+		entry->bits = NULL;
+	}
+	hash_search(bitmap_cache, &key, HASH_REMOVE, NULL);
+}
+
+/*
+ * Evict all bitmap cache entries for a relation.
+ *
+ * Called from columnar_remove_storage() on DROP TABLE / TRUNCATE.
+ * Uses collect-then-delete to avoid modifying the HTAB during iteration.
+ */
+static void
+columnar_bitmap_cache_evict_relation(const RelFileLocator *locator)
+{
+	Oid			target_db = (Oid) PG_LOCATOR_DB(locator);
+	Oid			target_rel = (Oid) PG_LOCATOR_REL(locator);
+	HASH_SEQ_STATUS seq;
+	ColumnarBitmapCacheEntry *entry;
+	ColumnarBitmapCacheKey *keys;
+	int			nkeys = 0;
+	int			maxkeys = 64;
+	int			i;
+
+	if (bitmap_cache == NULL)
+		return;
+
+	keys = palloc(sizeof(ColumnarBitmapCacheKey) * maxkeys);
+
+	hash_seq_init(&seq, bitmap_cache);
+	while ((entry = (ColumnarBitmapCacheEntry *) hash_seq_search(&seq)) != NULL)
+	{
+		if (entry->key.dbOid != target_db || entry->key.relNumber != target_rel)
+			continue;
+
+		if (nkeys >= maxkeys)
+		{
+			maxkeys *= 2;
+			keys = repalloc(keys, sizeof(ColumnarBitmapCacheKey) * maxkeys);
+		}
+		keys[nkeys++] = entry->key;
+	}
+	/* seq scan ran to completion — no need for hash_seq_term */
+
+	for (i = 0; i < nkeys; i++)
+	{
+		bool		found;
+
+		entry = hash_search(bitmap_cache, &keys[i], HASH_FIND, &found);
+		if (found && entry->bits != NULL)
+		{
+			pfree(entry->bits);
+			entry->bits = NULL;
+		}
+		hash_search(bitmap_cache, &keys[i], HASH_REMOVE, NULL);
+	}
+
+	pfree(keys);
+}
+
 char *
 columnar_dir_path(const RelFileLocator *locator)
 {
@@ -484,6 +701,7 @@ columnar_remove_storage(const RelFileLocator *locator)
 	 */
 	columnar_metadata_cache_evict(locator);
 	columnar_stats_cache_evict_relation(locator);
+	columnar_bitmap_cache_evict_relation(locator);
 
 	dir = opendir(dirpath);
 	if (dir == NULL)
@@ -1222,20 +1440,69 @@ uint8_t *
 columnar_read_delete_bitmap(const RelFileLocator *locator,
 							int stripe_id, int64_t row_count)
 {
-	char	   *path = columnar_deleted_path(locator, stripe_id);
+	char	   *path;
 	FILE	   *fp;
 	int64_t		nbytes = (row_count + 7) / 8;
 	uint8_t    *bits;
 
+	/*
+	 * Cache lookup.  On a hit we return a palloc'd copy in
+	 * CurrentMemoryContext so the caller can pfree it safely without
+	 * disturbing the cached state.
+	 */
+	{
+		ColumnarBitmapCacheKey ckey;
+		ColumnarBitmapCacheEntry *centry;
+		bool		found;
+
+		if (bitmap_cache == NULL)
+			columnar_bitmap_cache_init();
+
+		memset(&ckey, 0, sizeof(ckey));
+		ckey.dbOid = (Oid) PG_LOCATOR_DB(locator);
+		ckey.relNumber = (Oid) PG_LOCATOR_REL(locator);
+		ckey.stripe_id = stripe_id;
+
+		centry = hash_search(bitmap_cache, &ckey, HASH_FIND, &found);
+		if (found)
+		{
+			/* Stripe has no deletions (confirmed by a previous fopen miss) */
+			if (centry->file_absent)
+				return NULL;
+
+			/* Return a palloc'd copy; caller may pfree it freely */
+			bits = palloc(nbytes);
+			memcpy(bits, centry->bits, nbytes);
+			return bits;
+		}
+	}
+
+	/* Cache miss — read the .deleted file from disk */
+	path = columnar_deleted_path(locator, stripe_id);
 	fp = fopen(path, "rb");
 	pfree(path);
 
 	if (fp == NULL)
-		return NULL;			/* no deletions for this stripe */
+	{
+		/*
+		 * File absent means no rows have been deleted in this stripe.
+		 * Cache the absence so subsequent calls skip the fopen() entirely.
+		 */
+		if (errno == ENOENT)
+			columnar_bitmap_cache_update(locator, stripe_id, NULL, 0);
+		return NULL;
+	}
 
 	bits = palloc0(nbytes);
 	(void) fread(bits, 1, nbytes, fp);
 	fclose(fp);
+
+	/*
+	 * Populate the cache.  The bitmap is mutable (updated by DELETE), so
+	 * the cached copy is kept in sync via columnar_set_deleted_bit.
+	 */
+	columnar_bitmap_cache_update(locator, stripe_id, bits, nbytes);
+
 	return bits;
 }
 
@@ -1250,17 +1517,47 @@ columnar_set_deleted_bit(const RelFileLocator *locator,
 	uint8_t    *bits;
 	FILE	   *fp;
 
-	/* Read existing bitmap or allocate a fresh zeroed one */
-	fp = fopen(path, "rb");
-	if (fp != NULL)
+	/*
+	 * Obtain the current bitmap — from cache if available, otherwise
+	 * from disk.  This eliminates the "read" half of the read-modify-write
+	 * cycle for every DELETE after the first one on a given stripe.
+	 */
 	{
-		bits = palloc0(nbytes);
-		(void) fread(bits, 1, nbytes, fp);
-		fclose(fp);
-	}
-	else
-	{
-		bits = palloc0(nbytes);
+		ColumnarBitmapCacheKey ckey;
+		ColumnarBitmapCacheEntry *centry;
+		bool		found;
+
+		if (bitmap_cache == NULL)
+			columnar_bitmap_cache_init();
+
+		memset(&ckey, 0, sizeof(ckey));
+		ckey.dbOid = (Oid) PG_LOCATOR_DB(locator);
+		ckey.relNumber = (Oid) PG_LOCATOR_REL(locator);
+		ckey.stripe_id = stripe_id;
+
+		centry = hash_search(bitmap_cache, &ckey, HASH_FIND, &found);
+
+		if (found && !centry->file_absent && centry->bits != NULL)
+		{
+			/* Cache hit: copy cached bits into a local working buffer */
+			bits = palloc(nbytes);
+			memcpy(bits, centry->bits, nbytes);
+		}
+		else
+		{
+			/*
+			 * Cache miss or file_absent (no deletions yet): allocate a
+			 * zeroed bitmap and try to populate it from the existing file.
+			 * If the file does not exist yet, we start from all-zeros.
+			 */
+			bits = palloc0(nbytes);
+			fp = fopen(path, "rb");
+			if (fp != NULL)
+			{
+				(void) fread(bits, 1, nbytes, fp);
+				fclose(fp);
+			}
+		}
 	}
 
 	/* Set the bit for this row */
@@ -1294,6 +1591,15 @@ columnar_set_deleted_bit(const RelFileLocator *locator,
 	}
 
 	fclose(fp);
+
+	/*
+	 * Update the cache with the newly-written bitmap so that subsequent
+	 * reads and deletes on this stripe are served from RAM.  We update
+	 * after the fwrite to ensure the cache only reflects data that is
+	 * safely on disk.
+	 */
+	columnar_bitmap_cache_update(locator, stripe_id, bits, nbytes);
+
 	pfree(bits);
 	pfree(path);
 }

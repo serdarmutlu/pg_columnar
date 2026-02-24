@@ -259,12 +259,14 @@ Three backend-local in-memory caches eliminate repeated file I/O within a sessio
 |---|---|---|
 | Metadata cache | `(dbOid, relNumber)` | One metadata file read per TID during index scans |
 | Stats cache | `(dbOid, relNumber, stripe_id)` | One `.stats` file read per stripe per scan |
+| Bitmap cache | `(dbOid, relNumber, stripe_id)` | One `.deleted` file read per stripe per scan + read half of DELETE read-modify-write |
 
-Both caches are backend-local (not shared across connections) and are automatically
+All caches are backend-local (not shared across connections) and are automatically
 invalidated on `DROP TABLE`, `TRUNCATE`, and `VACUUM`.
 
-The stats cache also stores a **"file absent" marker** for stripes that pre-date the
-statistics feature, so repeated scans of older tables do not retry failed `fopen` calls.
+Both the stats cache and the bitmap cache store a **"file absent" marker** for stripes
+that have no companion file (pre-Level-3 stripes for stats; stripes with no deletions
+for bitmaps), so repeated scans do not retry failed `fopen` calls.
 
 ## Current Limitations
 
