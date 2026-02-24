@@ -51,9 +51,11 @@ pg_columnar/
 
 ```
 $PGDATA/columnar/<dbOid>/<relfilenode>/
-    metadata          # plain-text: "num_stripes total_rows\n" then one line per stripe
-    stripe_000001.arrow
+    metadata                      # plain-text: "num_stripes total_rows\n" then one line per stripe
+    stripe_000001.arrow           # Arrow IPC stream (one RecordBatch)
+    stripe_000001.deleted         # delete bitmap — only present if rows were deleted
     stripe_000002.arrow
+    stripe_000002.deleted
     ...
 ```
 
@@ -66,9 +68,18 @@ $PGDATA/columnar/<dbOid>/<relfilenode>/
 `compression` is the `ColumnarCompression` enum: `0`=NONE, `1`=LZ4, `2`=ZSTD.
 The reader also accepts the old 3-field format (no compression fields) and defaults to NONE.
 
+After VACUUM, a fully-deleted stripe has `row_count=0` and no `.arrow` or `.deleted` files
+on disk. Its metadata entry is preserved at its original position for TID stability
+(removing it would shift all later stripe block numbers and invalidate existing indexes).
+
 Each `.arrow` file is a complete Arrow IPC stream (schema message + one RecordBatch + EOS).
 Compressed stripes store the entire IPC stream compressed as a single blob; decompression
 happens fully in memory before nanoarrow reads the stream.
+
+**Delete bitmap (`.deleted`) file format:**
+A packed bitset of `ceil(row_count / 8)` bytes. Bit `i` (0-based) set means row `i`
+within that stripe is logically deleted. The file is created on the first delete targeting
+a row in that stripe, and is read/modified with read-modify-write semantics.
 
 ### Key Constants
 
@@ -107,17 +118,60 @@ before the first SET.
 
 ---
 
+## Delete / Update Path
+
+Arrow IPC stripe files are write-once and immutable. Logical deletion uses a **delete
+bitmap** companion file rather than modifying the stripe file.
+
+### DELETE
+
+1. `columnar_tuple_delete` decodes the TID to get `(stripe_index, row_offset)`.
+2. **Eager flush:** if the TID points to the active write buffer (not yet on disk),
+   the buffer is flushed to disk first, converting it to a normal on-disk stripe.
+3. Calls `columnar_set_deleted_bit()` — read-modify-write of the
+   `stripe_XXXXXX.deleted` file.
+
+### UPDATE
+
+`columnar_tuple_update` decomposes into:
+1. **Delete old row:** calls `columnar_tuple_delete(old_tid)`.
+2. **Insert new row:** calls `columnar_tuple_insert(new_slot)` — appends to the
+   write buffer as a normal insert. The executor receives the new TID and calls
+   `ExecInsertIndexTuples` to add the new index entry.
+
+Stale index entries pointing to the old TID are **not** removed immediately. They are
+skipped transparently during index scans (bitmap check in `columnar_index_fetch_tuple`).
+Index VACUUM cleans them up over time.
+
+### Visibility
+
+The delete bitmap is loaded once per stripe when the stripe is opened:
+- **Sequential scans:** `columnar_open_stripe` loads the bitmap into
+  `scan->current_delete_bitmap`. `columnar_scan_getnextslot` calls
+  `columnar_is_deleted()` on every row; deleted rows are skipped silently.
+- **Index scans:** `columnar_index_fetch_tuple` loads the bitmap into
+  `ColumnarIndexFetchData.cached_delete_bitmap` when caching a new stripe's RecordBatch.
+  The bitmap is checked before returning a row; returns `false` for deleted rows.
+- **Zero-row stripes** (fully vacuumed): both seq scan and index fetch skip them
+  immediately without opening any file.
+
+---
+
 ## Read Path
 
 `columnar_scan_begin` reads the metadata file and caches `StripeMetadata[]`.
 
 `columnar_scan_getnextslot` iterates stripes:
-1. Opens each stripe with `columnar_open_stripe_stream`.
-2. For **NONE** compression: `ArrowIpcInputStreamInitFile` — reads from FILE* lazily.
-3. For **LZ4/ZSTD** compression: reads entire file into memory, decompresses, then
+1. **Skips stripes with `row_count == 0`** (fully vacuumed, no file on disk).
+2. Opens each remaining stripe with `columnar_open_stripe_stream` and loads the
+   corresponding delete bitmap (NULL if no `.deleted` file exists).
+3. For **NONE** compression: `ArrowIpcInputStreamInitFile` — reads from FILE* lazily.
+4. For **LZ4/ZSTD** compression: reads entire file into memory, decompresses, then
    `ArrowIpcInputStreamInitBuffer` — reads from an in-memory `ArrowBuffer`.
-4. Calls `get_schema` immediately; calls `get_next` per-batch in the scan loop.
-5. After all on-disk stripes, optionally reads from the active write buffer (in-progress rows).
+5. Calls `get_schema` immediately; calls `get_next` per-batch in the scan loop.
+6. **Skips rows where `columnar_is_deleted(bitmap, row_offset)` is true.**
+7. After all on-disk stripes, optionally reads from the active write buffer
+   (in-progress rows that have not yet been flushed).
 
 ---
 
@@ -161,13 +215,17 @@ Called by the executor during an `Index Scan` plan node. Given a TID from the in
 
 ### `REINDEX` — `columnar_index_validate_scan`
 
-No-op. Since columnar tables have no MVCC and no DELETE/UPDATE support, every tuple
-that existed at index-build time is always live — there is nothing to validate.
+No-op. There is no MVCC and no per-tuple visibility information in the index entries
+themselves. The delete bitmap is the sole source of truth for live vs. deleted rows.
+Index validate scan cannot meaningfully check bitmaps (it operates on TIDs without
+having the full scan context), so it is left as a no-op. Deleted-row index entries
+are filtered at read time via bitmap checks in `columnar_index_fetch_tuple`.
 
 ### `columnar_index_delete_tuples`
 
-Returns `InvalidTransactionId`. No tuples can ever become dead, so there are no
-deletable index entries.
+Returns `InvalidTransactionId`. Columnar tables do not use PostgreSQL's HOT chain
+or dead-tuple tracking. Stale index entries for deleted rows are skipped transparently
+during index scans (bitmap check) and are cleaned up by index VACUUM over time.
 
 ### Index Limitations
 
@@ -179,6 +237,53 @@ deletable index entries.
   (Seq scan is often competitive for low-selectivity queries.)
 - **No index-only scans.** The TAM always returns the full tuple; PostgreSQL's
   index-only scan optimisation is not applicable.
+- **Stale entries after UPDATE.** After `UPDATE`, the old TID's index entry remains
+  until index VACUUM removes it. It is silently skipped during index scans (bitmap
+  check returns false). This is correct but may slightly slow index scans on heavily
+  updated tables.
+
+---
+
+## VACUUM
+
+`columnar_relation_vacuum` is fully implemented. It is called by PostgreSQL's autovacuum
+daemon and by explicit `VACUUM` commands.
+
+### What VACUUM does
+
+1. **Iterates all stripes** in the metadata array.
+2. For each stripe, reads its delete bitmap (if it exists) and counts deleted rows.
+3. **Fully-deleted stripes** (`deleted_rows == row_count`):
+   - Unlinks `stripe_XXXXXX.arrow` from disk.
+   - Unlinks `stripe_XXXXXX.deleted` from disk.
+   - Sets `stripe_meta[i].row_count = 0` and `stripe_meta[i].file_size = 0` in the
+     in-memory metadata array. **The entry is not removed** — doing so would shift
+     all subsequent stripe block numbers and invalidate existing index TIDs.
+4. **Partially-deleted stripes** (`0 < deleted_rows < row_count`):
+   - **No file rewriting.** Rewriting the stripe would shift row offsets for surviving
+     rows and invalidate their TIDs in existing indexes. Full compaction (stripe
+     rewrite + index rebuild) is deferred to Phase 3.
+   - The `.deleted` bitmap file is kept in place.
+   - The surviving row count is subtracted from `total_rows`.
+5. **Rewrites the metadata file** if any stripes changed.
+
+### After VACUUM
+
+- **Fully-deleted stripes** have `row_count=0` in the metadata array and no files on
+  disk. Sequential scans skip them (`row_count == 0` check). Index fetches for their
+  TIDs return `false` immediately.
+- **Partially-deleted stripes** still have their `.deleted` bitmap on disk. Deleted
+  rows are filtered at read time as before.
+- `total_rows` in the metadata is updated to reflect the current live row count,
+  keeping planner estimates accurate.
+
+### Space reclaim characteristics
+
+| Case | After VACUUM |
+|---|---|
+| Fully-deleted stripe | `.arrow` + `.deleted` files removed; full space reclaimed |
+| Partially-deleted stripe | `.arrow` kept; space proportional to deleted rows **not** reclaimed until Phase 3 |
+| Updated rows | Old TID's space not reclaimed (same as partially-deleted); new row appended as normal insert |
 
 ---
 
@@ -228,13 +333,20 @@ if (IsParallelWorker() && pscan != NULL)
 
 ## Known Limitations
 
-- **No MVCC.** All rows are always visible. No DELETE or UPDATE support.
+- **No MVCC.** All rows are always visible; there is no snapshot isolation or
+  per-transaction visibility. Concurrent DML from two sessions can see each other's
+  changes immediately.
+- **DELETE / UPDATE work, but space reclaim is partial.** Deleted rows in
+  partially-deleted stripes stay on disk until Phase 3 (full stripe compaction).
+  Fully-deleted stripes are reclaimed by VACUUM. Space occupied by old UPDATE
+  versions is also only reclaimed when the stripe is fully deleted.
+- **Stale index entries after UPDATE.** Old-TID index entries remain until index
+  VACUUM removes them. They are silently skipped during index scans (bitmap check).
 - **No parallel Seq Scan.** For a `Gather → Parallel Seq Scan` on a single columnar
   table, only the leader process scans the stripes; workers return 0 rows. This means
   single-table parallel scans don't actually parallelise yet.
 - **No TOAST.** `columnar_relation_needs_toast_table` returns false.
 - **No ANALYZE.** `columnar_scan_analyze_next_block` always returns false (stub).
-- **No VACUUM.** `columnar_relation_vacuum` is a no-op.
 - **No tablespace support.** `columnar_relation_copy_data` raises an error.
 - **Storage size not visible via `pg_total_relation_size`.** Stripe files live outside
   PostgreSQL's normal heap storage, so standard size functions report 0 bytes.
@@ -355,4 +467,25 @@ ORDER BY t.relname, i.relname;
 SET enable_seqscan = off;
 EXPLAIN (ANALYZE) SELECT order_id FROM orders_columnar WHERE category = 'Electronics' LIMIT 5;
 RESET enable_seqscan;
+
+-- Test DELETE: remove a specific row and verify it disappears from scan
+DELETE FROM orders_columnar WHERE order_id = 42;
+SELECT COUNT(*) FROM orders_columnar WHERE order_id = 42;  -- expect 0
+
+-- Test UPDATE: verify new value visible, old value gone
+UPDATE orders_columnar SET amount = 99.99 WHERE order_id = 1;
+SELECT amount FROM orders_columnar WHERE order_id = 1;     -- expect 99.99
+
+-- Check delete bitmap files on disk (substitute actual relfilenode)
+-- ls -lh /opt/homebrew/var/postgresql@17/columnar/16911/<relfilenode>/*.deleted
+
+-- Inspect metadata file to see stripe row counts and total_rows
+-- cat /opt/homebrew/var/postgresql@17/columnar/16911/<relfilenode>/metadata
+
+-- Run VACUUM and check that fully-deleted stripes are removed
+VACUUM orders_columnar;
+-- After VACUUM: verify live row count is correct
+SELECT COUNT(*) FROM orders_columnar;
+-- Check disk: fully-deleted stripe files should be gone
+-- ls -lh /opt/homebrew/var/postgresql@17/columnar/16911/<relfilenode>/
 ```

@@ -110,6 +110,53 @@ Typical compression ratios (varies with data):
 
 **Note:** Compressed stripes are not readable by external Arrow tools (PyArrow, DuckDB, etc.) since the entire IPC stream is compressed as a single blob. Uncompressed stripes remain fully compatible.
 
+### DELETE and UPDATE
+
+Standard SQL DELETE and UPDATE are fully supported:
+
+```sql
+-- Delete specific rows
+DELETE FROM measurements WHERE sensor = 'sensor_5';
+
+-- Conditional delete
+DELETE FROM measurements WHERE value < 1.0 AND recorded < now() - interval '30 days';
+
+-- Update a single column
+UPDATE measurements SET value = value * 1.05 WHERE sensor = 'sensor_1';
+
+-- Update with a subquery
+UPDATE measurements
+SET value = sub.avg_val
+FROM (SELECT sensor, avg(value) AS avg_val FROM measurements GROUP BY sensor) sub
+WHERE measurements.sensor = sub.sensor;
+```
+
+Deletes use a **delete bitmap** stored alongside each stripe file (`stripe_XXXXXX.deleted`).
+The Arrow IPC stripe file itself is never modified — deleted rows are filtered at read time.
+UPDATE is implemented as a delete of the old row plus an insert of the new row.
+
+Stale index entries for updated rows are transparently skipped during index scans
+and are cleaned up by `VACUUM`.
+
+### VACUUM
+
+`VACUUM` reclaims disk space from deleted rows:
+
+```sql
+VACUUM measurements;
+```
+
+Space reclaim behaviour:
+
+| Situation | After VACUUM |
+|---|---|
+| All rows in a stripe deleted | Stripe file removed from disk; full space reclaimed |
+| Some rows in a stripe deleted | Stripe file kept (TIDs must not shift); space reclaimed in Phase 3 |
+| Rows updated | Same as partially-deleted until Phase 3 |
+
+After VACUUM, `SELECT COUNT(*)` and planner estimates reflect only live rows.
+Autovacuum runs `VACUUM` automatically in the background.
+
 ### Drop or truncate
 
 ```sql
@@ -142,13 +189,18 @@ Data is stored under `$PGDATA/columnar/<dbOid>/<relNumber>/`:
 
 ```
 $PGDATA/columnar/16384/16421/
-    metadata              # stripe index (count, row counts, sizes)
-    stripe_000001.arrow   # Arrow IPC stream
+    metadata                      # stripe index (count, row counts, sizes)
+    stripe_000001.arrow           # Arrow IPC stream (one RecordBatch)
+    stripe_000001.deleted         # delete bitmap — only present if rows were deleted
     stripe_000002.arrow
     ...
 ```
 
 Rows are buffered in memory and flushed to a new stripe file every 10,000 rows or at transaction commit.
+
+The `.deleted` file is a packed bitset (`ceil(row_count / 8)` bytes). Bit `i` set means
+row `i` within that stripe is logically deleted. After VACUUM, fully-deleted stripes have
+their `.arrow` and `.deleted` files removed from disk.
 
 ## Reading Stripes Externally
 
@@ -174,15 +226,22 @@ CREATE INDEX ON measurements (value, sensor);
 REINDEX INDEX measurements_sensor_idx;
 ```
 
-Index scans and index-only scans work correctly. Indexes can be created before or after data is loaded.
+Index scans work correctly, including after DELETE and UPDATE operations. Indexes can be
+created before or after data is loaded.
+
+Note: index-only scans are not supported — the access method always fetches the full tuple.
 
 ## Current Limitations
 
-- **No UPDATE/DELETE** -- these operations raise an error
-- **No MVCC** -- no snapshot isolation for columnar data
-- **No WAL logging** -- crash safety is limited to fsync
-- **No parallel scan**
-- **No VACUUM** -- runs as a no-op
+- **No MVCC** -- no snapshot isolation; all rows are always visible to all sessions
+- **No WAL logging** -- crash safety is limited to fsync; stripe files and bitmaps
+  are written outside PostgreSQL's WAL infrastructure
+- **No parallel scan** -- parallel sequential scans on a single columnar table are
+  not parallelised (workers return 0 rows; only the leader scans)
+- **Partial space reclaim after DELETE/UPDATE** -- deleted rows inside a partially-deleted
+  stripe occupy disk space until Phase 3 compaction; only fully-deleted stripes are
+  reclaimed by VACUUM
+- **No ANALYZE** -- `ANALYZE` is a no-op; the planner uses estimates from stripe metadata
 
 ## License
 
