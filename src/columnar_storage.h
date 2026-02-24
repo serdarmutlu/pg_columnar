@@ -138,4 +138,88 @@ columnar_is_deleted(const uint8_t *bits, int64_t row_offset)
 	return (bits[row_offset / 8] & (1 << (row_offset % 8))) != 0;
 }
 
+/* ----------------------------------------------------------------
+ * Per-stripe min/max statistics
+ *
+ * Each stripe that has trackable columns gets a companion file:
+ *   $PGDATA/columnar/<dbOid>/<relfilenode>/stripe_XXXXXX.stats
+ *
+ * File format (text):
+ *   Line 1:           "PGCS 1 <ncols>"
+ *   Lines 2..ncols+1: "<stat_type> <has_stats> <min_val> <max_val>"
+ *
+ * stat_type: 0=NONE, 1=INT, 2=FLOAT
+ * has_stats: 0 or 1 (0 means the column was entirely NULL in this stripe)
+ * min_val, max_val: int64 text representation
+ *   - INT:   value in PG-epoch units (int2/4/8 → raw; date → PG days;
+ *             timestamp → PG microseconds)
+ *   - FLOAT: IEEE-754 bit pattern of the double value via memcpy
+ *   - NONE / has_stats=0: both written as 0 (ignored on read)
+ *
+ * An absent stats file means stats are not available for that stripe
+ * (e.g. the stripe was written before Level-3 was installed).  Pruning
+ * is silently skipped for such stripes.  Stats failures emit a WARNING
+ * but never ERROR — stats are purely advisory.
+ * ----------------------------------------------------------------
+ */
+
+typedef enum ColumnarStatType
+{
+	COLUMNAR_STAT_TYPE_NONE  = 0,	/* not tracked (text, bool, etc.) */
+	COLUMNAR_STAT_TYPE_INT   = 1,	/* min/max stored as int64 in PG-epoch units */
+	COLUMNAR_STAT_TYPE_FLOAT = 2,	/* min/max stored as double */
+} ColumnarStatType;
+
+/*
+ * Min/max statistics for one non-dropped column within a stripe.
+ * Columns are indexed in Arrow schema child order (= non-dropped att order).
+ */
+typedef struct ColumnarColumnStats
+{
+	int		stat_type;		/* ColumnarStatType */
+	bool	has_stats;		/* false if the column was entirely NULL */
+	int64_t min_int;		/* STAT_TYPE_INT: PG-epoch minimum */
+	int64_t max_int;		/* STAT_TYPE_INT: PG-epoch maximum */
+	double	min_float;		/* STAT_TYPE_FLOAT: minimum as double */
+	double	max_float;		/* STAT_TYPE_FLOAT: maximum as double */
+} ColumnarColumnStats;
+
+/*
+ * All column statistics for a single stripe.
+ */
+typedef struct ColumnarStripeStats
+{
+	int					ncols;	/* entries in cols[] */
+	ColumnarColumnStats *cols;	/* palloc'd array */
+} ColumnarStripeStats;
+
+/*
+ * Build the path for a stripe's statistics file.
+ * Returns a palloc'd string.
+ */
+extern char *columnar_stats_path(const RelFileLocator *locator, int stripe_id);
+
+/*
+ * Write per-stripe min/max stats to stripe_XXXXXX.stats.
+ * Failures are emitted as WARNINGs; stats are advisory.
+ */
+extern void columnar_write_stripe_stats(const RelFileLocator *locator,
+										int stripe_id,
+										const ColumnarStripeStats *stats);
+
+/*
+ * Read stats for a stripe.
+ * Returns a palloc'd ColumnarStripeStats, or NULL if the file is absent
+ * or incompatible (ncols mismatch after an ALTER TABLE ADD/DROP COLUMN).
+ * expected_ncols must equal the number of non-dropped columns.
+ */
+extern ColumnarStripeStats *columnar_read_stripe_stats(const RelFileLocator *locator,
+													   int stripe_id,
+													   int expected_ncols);
+
+/*
+ * Free a ColumnarStripeStats returned by columnar_read_stripe_stats.
+ */
+extern void columnar_free_stripe_stats(ColumnarStripeStats *stats);
+
 #endif /* COLUMNAR_STORAGE_H */

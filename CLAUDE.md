@@ -24,7 +24,7 @@ pg_columnar/
 │   ├── pg_columnar.c          # _PG_init, GUC registration, xact callback
 │   ├── columnar_tableam.c     # Table Access Method: all scan/insert/index/DDL hooks
 │   ├── columnar_storage.c     # Stripe & metadata file I/O
-│   ├── columnar_storage.h     # StripeMetadata, ColumnarMetadata, compression enum
+│   ├── columnar_storage.h     # StripeMetadata, ColumnarMetadata, ColumnarStripeStats, compression enum
 │   ├── columnar_write_buffer.c # In-memory row accumulator, auto-flush logic
 │   ├── columnar_write_buffer.h # ColumnarWriteBuffer struct, COLUMNAR_FLUSH_THRESHOLD
 │   ├── columnar_typemap.c     # PostgreSQL Datum ↔ Arrow type conversion
@@ -54,8 +54,10 @@ $PGDATA/columnar/<dbOid>/<relfilenode>/
     metadata                      # plain-text: "num_stripes total_rows\n" then one line per stripe
     stripe_000001.arrow           # Arrow IPC stream (one RecordBatch)
     stripe_000001.deleted         # delete bitmap — only present if rows were deleted
+    stripe_000001.stats           # per-column min/max statistics — only present if Level 3 active
     stripe_000002.arrow
     stripe_000002.deleted
+    stripe_000002.stats
     ...
 ```
 
@@ -68,13 +70,30 @@ $PGDATA/columnar/<dbOid>/<relfilenode>/
 `compression` is the `ColumnarCompression` enum: `0`=NONE, `1`=LZ4, `2`=ZSTD.
 The reader also accepts the old 3-field format (no compression fields) and defaults to NONE.
 
-After VACUUM, a fully-deleted stripe has `row_count=0` and no `.arrow` or `.deleted` files
+After VACUUM, a fully-deleted stripe has `row_count=0` and no `.arrow`, `.deleted`, or `.stats` files
 on disk. Its metadata entry is preserved at its original position for TID stability
 (removing it would shift all later stripe block numbers and invalidate existing indexes).
 
 Each `.arrow` file is a complete Arrow IPC stream (schema message + one RecordBatch + EOS).
 Compressed stripes store the entire IPC stream compressed as a single blob; decompression
 happens fully in memory before nanoarrow reads the stream.
+
+**Stats (`.stats`) file format:**
+```
+PGCS 1 <ncols>
+<stat_type> <has_stats> <min_val> <max_val>
+...  (one line per non-dropped column, in Arrow schema child order)
+```
+`stat_type`: 0=NONE (text/bool/etc.), 1=INT, 2=FLOAT.
+`has_stats`: 0 or 1 (0 means all-NULL column in this stripe).
+`min_val`/`max_val`: int64 text.
+- For INT: value in PG-epoch units (INT2/4/8 = raw int; DATE = days since 2000-01-01;
+  TIMESTAMP = µs since 2000-01-01).
+- For FLOAT: IEEE-754 bit pattern of the double value (via `memcpy`).
+- For NONE / `has_stats=0`: both written as 0 (ignored on read).
+
+Absent `.stats` file means stats were not collected (stripe predates Level 3).  Pruning
+is silently skipped for such stripes — fully backward-compatible.
 
 **Delete bitmap (`.deleted`) file format:**
 A packed bitset of `ceil(row_count / 8)` bytes. Bit `i` (0-based) set means row `i`
@@ -99,6 +118,58 @@ Registered in `_PG_init()` (lazy-loaded when first columnar relation is accessed
 before issuing `SET columnar.compression = ...` or the SET will be silently ignored.
 `02_load_data.sql` does this explicitly with a `SELECT COUNT(*) FROM orders_columnar`
 before the first SET.
+
+---
+
+## Caching Architecture
+
+Three caching / optimization levels are implemented:
+
+### Level 1 — Backend-local Metadata Cache (implemented)
+
+`columnar_read_metadata` was called on every TID lookup in `columnar_index_fetch_tuple`
+(one file read per TID during an index scan).  A backend-local `HTAB` in `TopMemoryContext`
+now caches `ColumnarMetadata` keyed on `(dbOid, relNumber)`.
+
+- **Hit path:** returns a `palloc`'d copy in `CurrentMemoryContext`; zero I/O.
+- **Update point:** `columnar_write_metadata` always refreshes the cache after writing.
+- **Eviction:** `columnar_remove_storage` evicts unconditionally (DROP TABLE / TRUNCATE).
+- **Cross-backend:** intentionally not shared — matches the no-MVCC stance of the TAM.
+
+### Level 3 — Per-stripe Min/Max Statistics (implemented)
+
+Each stripe gets a companion `stripe_XXXXXX.stats` text file written at flush time by
+`columnar_collect_stripe_stats` (called from `columnar_write_stripe`).
+
+**Tracked types:**
+
+| PG type | Arrow format | Stat type | Stored value |
+|---|---|---|---|
+| INT2/INT4/INT8 | `s`/`i`/`l` | INT | raw integer |
+| DATE | `tdD` | INT | days since PG epoch (2000-01-01) |
+| TIMESTAMP/TZ | `tsu:...` | INT | µs since PG epoch |
+| FLOAT4/FLOAT8 | `f`/`g` | FLOAT | double value |
+| BOOL, TEXT, BYTEA, UUID, NUMERIC | other | NONE | not tracked |
+
+**Pruning (`columnar_stripe_should_skip`):** called from `columnar_scan_getnextslot`
+when `rs_nkeys > 0`.  Supports all five B-tree strategies (< ≤ = ≥ >).  Returns `true`
+(skip stripe) only when it is guaranteed that no row can satisfy the scan key condition.
+
+**Important limitation:** PostgreSQL's sequential scan path passes `nkeys = 0` — WHERE
+clause quals are applied by the executor, not pushed down to the TAM.  Pruning fires only
+when a caller explicitly sets `rs_nkeys > 0`.  The infrastructure is correct and ready for
+Level 4 (custom scan node), which will pass explicit scan keys.
+
+**Backward compatibility:** Stripes written before Level 3 have no `.stats` file.
+`columnar_read_stripe_stats` returns NULL; pruning is silently skipped — no errors.
+
+**VACUUM integration:** `columnar_relation_vacuum` removes the `.stats` file for fully-
+deleted stripes alongside `.arrow` and `.deleted`.
+
+### Level 4 — Columnar Buffer Pool (planned)
+
+Custom scan node + shared stripe cache.  Supersedes Level 2 (shared stripe cache alone).
+Not yet implemented.
 
 ---
 

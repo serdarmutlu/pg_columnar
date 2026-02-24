@@ -324,6 +324,197 @@ columnar_slot_callbacks(Relation rel)
 }
 
 /* ----------------------------------------------------------------
+ * Min/max stripe pruning
+ *
+ * Returns true when it is guaranteed that no row in the stripe can
+ * satisfy all of the supplied scan keys, so the stripe can be skipped
+ * entirely.  Returns false (conservatively) when stats are unavailable.
+ *
+ * Important: PostgreSQL's sequential scan path typically passes nkeys = 0
+ * because WHERE-clause quals are applied by the executor after the TAM
+ * returns each row, not pushed down to the TAM.  Pruning therefore only
+ * fires when a caller explicitly sets rs_nkeys > 0 (e.g. a custom scan
+ * provider planned for Level 4).  The infrastructure is correct and safe;
+ * it simply has no opportunity to prune during plain seq-scan queries today.
+ * ----------------------------------------------------------------
+ */
+static bool
+columnar_stripe_should_skip(const RelFileLocator *locator,
+							StripeMetadata *sm,
+							struct ScanKeyData *keys,
+							int nkeys,
+							TupleDesc tupdesc)
+{
+	ColumnarStripeStats *stats;
+	int			k;
+	bool		skip = false;
+	int			ncols;
+	int			a;
+
+	/* Count non-dropped columns — must match the stats file's ncols */
+	ncols = 0;
+	for (a = 0; a < tupdesc->natts; a++)
+	{
+		if (!TupleDescAttr(tupdesc, a)->attisdropped)
+			ncols++;
+	}
+
+	stats = columnar_read_stripe_stats(locator, sm->stripe_id, ncols);
+	if (stats == NULL)
+		return false;			/* no stats → cannot prune */
+
+	for (k = 0; k < nkeys && !skip; k++)
+	{
+		struct ScanKeyData *key = &keys[k];
+		AttrNumber	attno = key->sk_attno;	/* 1-based */
+		Form_pg_attribute attr;
+		ColumnarColumnStats *cs;
+		int			child_idx;
+
+		/* Ignore NULL-related scan flags */
+		if (key->sk_flags & (SK_ISNULL | SK_SEARCHNULL | SK_SEARCHNOTNULL))
+			continue;
+
+		if (attno < 1 || attno > tupdesc->natts)
+			continue;
+
+		attr = TupleDescAttr(tupdesc, attno - 1);
+		if (attr->attisdropped)
+			continue;
+
+		/* child_idx = number of non-dropped columns before this attribute */
+		child_idx = 0;
+		for (a = 0; a < (int) attno - 1; a++)
+		{
+			if (!TupleDescAttr(tupdesc, a)->attisdropped)
+				child_idx++;
+		}
+
+		if (child_idx >= stats->ncols)
+			continue;
+
+		cs = &stats->cols[child_idx];
+
+		if (!cs->has_stats || cs->stat_type == COLUMNAR_STAT_TYPE_NONE)
+			continue;
+
+		if (cs->stat_type == COLUMNAR_STAT_TYPE_INT)
+		{
+			int64_t		key_val;
+			int64_t		stripe_min = cs->min_int;
+			int64_t		stripe_max = cs->max_int;
+
+			/*
+			 * Extract the comparison value in PG-epoch units.  These
+			 * match exactly what columnar_collect_stripe_stats stored:
+			 *   INT2/4/8  → raw integer
+			 *   DATE       → days since PG epoch (2000-01-01)
+			 *   TIMESTAMP  → µs since PG epoch
+			 */
+			switch (attr->atttypid)
+			{
+				case INT2OID:
+					key_val = (int64_t) DatumGetInt16(key->sk_argument);
+					break;
+				case INT4OID:
+					key_val = (int64_t) DatumGetInt32(key->sk_argument);
+					break;
+				case INT8OID:
+					key_val = DatumGetInt64(key->sk_argument);
+					break;
+				case DATEOID:
+					key_val = (int64_t) DatumGetDateADT(key->sk_argument);
+					break;
+				case TIMESTAMPOID:
+				case TIMESTAMPTZOID:
+					key_val = (int64_t) DatumGetTimestamp(key->sk_argument);
+					break;
+				default:
+					continue;	/* unsupported type — skip this key */
+			}
+
+			switch (key->sk_strategy)
+			{
+				case BTLessStrategyNumber:
+					/* col < key: impossible if stripe_min >= key */
+					if (stripe_min >= key_val)
+						skip = true;
+					break;
+				case BTLessEqualStrategyNumber:
+					/* col <= key: impossible if stripe_min > key */
+					if (stripe_min > key_val)
+						skip = true;
+					break;
+				case BTEqualStrategyNumber:
+					/* col = key: impossible if key outside [min, max] */
+					if (key_val < stripe_min || key_val > stripe_max)
+						skip = true;
+					break;
+				case BTGreaterEqualStrategyNumber:
+					/* col >= key: impossible if stripe_max < key */
+					if (stripe_max < key_val)
+						skip = true;
+					break;
+				case BTGreaterStrategyNumber:
+					/* col > key: impossible if stripe_max <= key */
+					if (stripe_max <= key_val)
+						skip = true;
+					break;
+				default:
+					break;
+			}
+		}
+		else					/* COLUMNAR_STAT_TYPE_FLOAT */
+		{
+			double		key_val;
+			double		stripe_min = cs->min_float;
+			double		stripe_max = cs->max_float;
+
+			switch (attr->atttypid)
+			{
+				case FLOAT4OID:
+					key_val = (double) DatumGetFloat4(key->sk_argument);
+					break;
+				case FLOAT8OID:
+					key_val = DatumGetFloat8(key->sk_argument);
+					break;
+				default:
+					continue;
+			}
+
+			switch (key->sk_strategy)
+			{
+				case BTLessStrategyNumber:
+					if (stripe_min >= key_val)
+						skip = true;
+					break;
+				case BTLessEqualStrategyNumber:
+					if (stripe_min > key_val)
+						skip = true;
+					break;
+				case BTEqualStrategyNumber:
+					if (key_val < stripe_min || key_val > stripe_max)
+						skip = true;
+					break;
+				case BTGreaterEqualStrategyNumber:
+					if (stripe_max < key_val)
+						skip = true;
+					break;
+				case BTGreaterStrategyNumber:
+					if (stripe_max <= key_val)
+						skip = true;
+					break;
+				default:
+					break;
+			}
+		}
+	}
+
+	columnar_free_stripe_stats(stats);
+	return skip;
+}
+
+/* ----------------------------------------------------------------
  * Sequential scan
  * ----------------------------------------------------------------
  */
@@ -511,15 +702,39 @@ columnar_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
 		/* Try to open the next stripe */
 		if (scan->current_stripe < scan->num_stripes)
 		{
+			StripeMetadata *sm = &scan->stripe_meta[scan->current_stripe];
+
 			/*
 			 * Skip stripes that were fully vacuumed (row_count == 0).
 			 * Their files have been removed; there is nothing to read.
 			 */
-			if (scan->stripe_meta[scan->current_stripe].row_count == 0)
+			if (sm->row_count == 0)
 			{
 				scan->current_stripe++;
 				continue;
 			}
+
+			/*
+			 * Min/max stripe pruning: skip stripes whose value ranges
+			 * cannot possibly satisfy the scan keys.
+			 *
+			 * Note: PostgreSQL's seq-scan path passes nkeys = 0 (quals
+			 * are filtered by the executor, not pushed to the TAM), so
+			 * pruning today is a no-op for plain WHERE-clause queries.
+			 * The infrastructure is ready for a Level-4 custom scan node
+			 * that will pass explicit scan keys.
+			 */
+			if (sscan->rs_nkeys > 0 &&
+				columnar_stripe_should_skip(RelationGetLocator(sscan->rs_rd),
+											sm,
+											sscan->rs_key,
+											sscan->rs_nkeys,
+											tupdesc))
+			{
+				scan->current_stripe++;
+				continue;
+			}
+
 			columnar_open_stripe(scan, scan->current_stripe);
 			scan->current_stripe++;
 			continue;
@@ -1515,19 +1730,22 @@ columnar_relation_vacuum(Relation rel, struct VacuumParams *params,
 		{
 			/*
 			 * Every row in this stripe is deleted.  Reclaim the disk space
-			 * by removing the stripe file and its delete bitmap.  Mark the
-			 * stripe as empty in metadata (row_count = 0); we keep the
-			 * entry in the stripes array so that TID block-numbers for
-			 * subsequent stripes do not shift, which would invalidate
-			 * existing index entries.
+			 * by removing the stripe file, its delete bitmap, and its
+			 * min/max stats file.  Mark the stripe as empty in metadata
+			 * (row_count = 0); we keep the entry in the stripes array so
+			 * that TID block-numbers for subsequent stripes do not shift,
+			 * which would invalidate existing index entries.
 			 */
 			char	   *stripe_path = columnar_stripe_path(locator, sm->stripe_id);
 			char	   *del_path = columnar_deleted_path(locator, sm->stripe_id);
+			char	   *stats_path = columnar_stats_path(locator, sm->stripe_id);
 
 			(void) unlink(stripe_path);
 			(void) unlink(del_path);
+			(void) unlink(stats_path);	/* optional; ignore if absent */
 			pfree(stripe_path);
 			pfree(del_path);
+			pfree(stats_path);
 
 			sm->row_count = 0;
 			sm->file_size = 0;

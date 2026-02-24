@@ -440,6 +440,286 @@ columnar_write_metadata(const RelFileLocator *locator, ColumnarMetadata *meta)
 	columnar_metadata_cache_update(locator, meta);
 }
 
+/* ----------------------------------------------------------------
+ * Per-stripe min/max statistics implementation
+ * ----------------------------------------------------------------
+ */
+
+char *
+columnar_stats_path(const RelFileLocator *locator, int stripe_id)
+{
+	char	   *path = palloc(MAXPGPATH);
+
+	snprintf(path, MAXPGPATH, "%s/columnar/%u/%u/stripe_%06d.stats",
+			 DataDir, PG_LOCATOR_DB(locator), PG_LOCATOR_REL(locator),
+			 stripe_id);
+	return path;
+}
+
+/*
+ * Collect per-column min/max statistics from a finished RecordBatch.
+ *
+ * Uses Arrow schema format strings to identify column types, which avoids
+ * introducing a dependency on the PG TupleDesc in the storage layer.
+ *
+ * Epoch conversion (Arrow → PG) is applied to DATE32 and TIMESTAMP so that
+ * stored stats can be compared directly with PG Datum values in the pruning
+ * layer without any additional conversion.
+ *
+ * Tracked types and their storage format:
+ *   INT16  ("s"), INT32 ("i"), INT64 ("l") → STAT_TYPE_INT, raw value
+ *   DATE32 ("tdD")                          → STAT_TYPE_INT, PG days
+ *   TIMESTAMP ("tsu:...")                   → STAT_TYPE_INT, PG microseconds
+ *   FLOAT  ("f"), DOUBLE ("g")             → STAT_TYPE_FLOAT, double value
+ *   Everything else (bool, text, …)        → STAT_TYPE_NONE (not tracked)
+ */
+static ColumnarStripeStats *
+columnar_collect_stripe_stats(struct ArrowSchema *schema,
+							  struct ArrowArrayView *batch_view,
+							  int64_t nrows)
+{
+	ColumnarStripeStats *stats;
+	int			ncols = (int) schema->n_children;
+	int			i;
+
+	stats = palloc(sizeof(ColumnarStripeStats));
+	stats->ncols = ncols;
+	if (ncols == 0)
+	{
+		stats->cols = NULL;
+		return stats;
+	}
+	stats->cols = palloc0(sizeof(ColumnarColumnStats) * ncols);
+
+	for (i = 0; i < ncols; i++)
+	{
+		struct ArrowArrayView *child = batch_view->children[i];
+		ColumnarColumnStats *cs = &stats->cols[i];
+		const char *fmt = schema->children[i]->format;
+		int			stat_type;
+		bool		date_epoch = false;
+		bool		ts_epoch = false;
+		int64_t		j;
+		bool		has_non_null = false;
+
+		/* Classify the column by its Arrow format string */
+		if (strcmp(fmt, "s") == 0)			/* INT16 */
+			stat_type = COLUMNAR_STAT_TYPE_INT;
+		else if (strcmp(fmt, "i") == 0)		/* INT32 */
+			stat_type = COLUMNAR_STAT_TYPE_INT;
+		else if (strcmp(fmt, "l") == 0)		/* INT64 */
+			stat_type = COLUMNAR_STAT_TYPE_INT;
+		else if (strcmp(fmt, "tdD") == 0)	/* DATE32 */
+		{
+			stat_type = COLUMNAR_STAT_TYPE_INT;
+			date_epoch = true;
+		}
+		else if (strncmp(fmt, "tsu:", 4) == 0)	/* TIMESTAMP µs (any tz) */
+		{
+			stat_type = COLUMNAR_STAT_TYPE_INT;
+			ts_epoch = true;
+		}
+		else if (strcmp(fmt, "f") == 0)		/* FLOAT32 */
+			stat_type = COLUMNAR_STAT_TYPE_FLOAT;
+		else if (strcmp(fmt, "g") == 0)		/* FLOAT64 */
+			stat_type = COLUMNAR_STAT_TYPE_FLOAT;
+		else
+		{
+			cs->stat_type = COLUMNAR_STAT_TYPE_NONE;
+			cs->has_stats = false;
+			continue;
+		}
+
+		cs->stat_type = stat_type;
+
+		/* Scan all rows to find min/max */
+		for (j = 0; j < nrows; j++)
+		{
+			if (ArrowArrayViewIsNull(child, j))
+				continue;
+
+			if (stat_type == COLUMNAR_STAT_TYPE_INT)
+			{
+				int64_t		raw = ArrowArrayViewGetIntUnsafe(child, j);
+				int64_t		val;
+
+				/* Convert from Arrow epoch to PG epoch */
+				if (date_epoch)
+					val = raw - INT64CONST(10957);			/* days */
+				else if (ts_epoch)
+					val = raw - INT64CONST(946684800000000);	/* µs */
+				else
+					val = raw;
+
+				if (!has_non_null)
+				{
+					cs->min_int = val;
+					cs->max_int = val;
+				}
+				else
+				{
+					if (val < cs->min_int)
+						cs->min_int = val;
+					if (val > cs->max_int)
+						cs->max_int = val;
+				}
+			}
+			else					/* FLOAT */
+			{
+				double		val = ArrowArrayViewGetDoubleUnsafe(child, j);
+
+				if (!has_non_null)
+				{
+					cs->min_float = val;
+					cs->max_float = val;
+				}
+				else
+				{
+					if (val < cs->min_float)
+						cs->min_float = val;
+					if (val > cs->max_float)
+						cs->max_float = val;
+				}
+			}
+			has_non_null = true;
+		}
+
+		cs->has_stats = has_non_null;
+	}
+
+	return stats;
+}
+
+void
+columnar_write_stripe_stats(const RelFileLocator *locator, int stripe_id,
+							const ColumnarStripeStats *stats)
+{
+	char	   *path = columnar_stats_path(locator, stripe_id);
+	FILE	   *fp;
+	int			i;
+
+	fp = fopen(path, "w");
+	if (fp == NULL)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("columnar: could not write stripe stats \"%s\": %m",
+						path)));
+		pfree(path);
+		return;
+	}
+
+	fprintf(fp, "PGCS 1 %d\n", stats->ncols);
+
+	for (i = 0; i < stats->ncols; i++)
+	{
+		const ColumnarColumnStats *cs = &stats->cols[i];
+
+		if (!cs->has_stats || cs->stat_type == COLUMNAR_STAT_TYPE_NONE)
+		{
+			/* No usable stats: write zeros */
+			fprintf(fp, "%d 0 0 0\n", cs->stat_type);
+		}
+		else if (cs->stat_type == COLUMNAR_STAT_TYPE_INT)
+		{
+			fprintf(fp, "1 1 %" PRId64 " %" PRId64 "\n",
+					cs->min_int, cs->max_int);
+		}
+		else					/* COLUMNAR_STAT_TYPE_FLOAT */
+		{
+			int64_t		min_bits,
+						max_bits;
+
+			memcpy(&min_bits, &cs->min_float, sizeof(min_bits));
+			memcpy(&max_bits, &cs->max_float, sizeof(max_bits));
+			fprintf(fp, "2 1 %" PRId64 " %" PRId64 "\n",
+					min_bits, max_bits);
+		}
+	}
+
+	fclose(fp);
+	pfree(path);
+}
+
+ColumnarStripeStats *
+columnar_read_stripe_stats(const RelFileLocator *locator,
+						   int stripe_id, int expected_ncols)
+{
+	char	   *path = columnar_stats_path(locator, stripe_id);
+	FILE	   *fp;
+	ColumnarStripeStats *stats;
+	char		header[64];
+	int			version,
+				ncols;
+	int			i;
+
+	fp = fopen(path, "r");
+	pfree(path);
+	if (fp == NULL)
+		return NULL;			/* no stats file */
+
+	/* Validate header: "PGCS <version> <ncols>" */
+	if (fgets(header, sizeof(header), fp) == NULL ||
+		sscanf(header, "PGCS %d %d", &version, &ncols) != 2 ||
+		version != 1 || ncols != expected_ncols)
+	{
+		fclose(fp);
+		return NULL;			/* corrupt or schema mismatch */
+	}
+
+	stats = palloc(sizeof(ColumnarStripeStats));
+	stats->ncols = ncols;
+	stats->cols = palloc0(sizeof(ColumnarColumnStats) * ncols);
+
+	for (i = 0; i < ncols; i++)
+	{
+		char		line[128];
+		int			stat_type,
+					has_stats_int;
+		int64_t		min_raw,
+					max_raw;
+
+		if (fgets(line, sizeof(line), fp) == NULL ||
+			sscanf(line, "%d %d %" SCNd64 " %" SCNd64,
+				   &stat_type, &has_stats_int, &min_raw, &max_raw) != 4)
+		{
+			fclose(fp);
+			columnar_free_stripe_stats(stats);
+			return NULL;
+		}
+
+		stats->cols[i].stat_type = stat_type;
+		stats->cols[i].has_stats = (has_stats_int != 0);
+
+		if (stats->cols[i].has_stats)
+		{
+			if (stat_type == COLUMNAR_STAT_TYPE_INT)
+			{
+				stats->cols[i].min_int = min_raw;
+				stats->cols[i].max_int = max_raw;
+			}
+			else if (stat_type == COLUMNAR_STAT_TYPE_FLOAT)
+			{
+				memcpy(&stats->cols[i].min_float, &min_raw, sizeof(double));
+				memcpy(&stats->cols[i].max_float, &max_raw, sizeof(double));
+			}
+		}
+	}
+
+	fclose(fp);
+	return stats;
+}
+
+void
+columnar_free_stripe_stats(ColumnarStripeStats *stats)
+{
+	if (stats == NULL)
+		return;
+	if (stats->cols)
+		pfree(stats->cols);
+	pfree(stats);
+}
+
 void
 columnar_write_stripe(const RelFileLocator *locator,
 					  struct ArrowSchema *schema,
@@ -594,6 +874,19 @@ columnar_write_stripe(const RelFileLocator *locator,
 	if (compressed)
 		pfree(compressed);
 	ArrowBufferReset(&ipc_buffer);
+
+	/*
+	 * Collect and write per-stripe min/max statistics.
+	 * batch_view is still valid here (the IPC writer only reads it).
+	 * Failures emit a WARNING but do not abort the write.
+	 */
+	{
+		ColumnarStripeStats *stripe_stats;
+
+		stripe_stats = columnar_collect_stripe_stats(schema, batch_view, nrows);
+		columnar_write_stripe_stats(locator, new_stripe_id, stripe_stats);
+		columnar_free_stripe_stats(stripe_stats);
+	}
 
 	/* Update metadata */
 	{
