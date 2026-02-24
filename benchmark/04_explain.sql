@@ -6,6 +6,29 @@
 -- from I/O cost when decompressing stripes (none vs. lz4 vs. zstd).
 -- =============================================================================
 
+-- ---------------------------------------------------------------------------
+-- Pre-flight: same empty-table guard as 03_benchmark.sql.
+-- ---------------------------------------------------------------------------
+\timing off
+\echo '=== PRE-FLIGHT: row counts (all must be > 0 for valid results) ==='
+SELECT
+    table_name,
+    row_count,
+    CASE
+        WHEN row_count = 0
+        THEN '*** EMPTY – run 02_load_data.sql first; plans below are MISLEADING ***'
+        ELSE 'OK'
+    END AS status
+FROM (
+    SELECT 'orders_heap'          AS table_name, COUNT(*) AS row_count FROM orders_heap
+    UNION ALL
+    SELECT 'orders_columnar'      AS table_name, COUNT(*) AS row_count FROM orders_columnar
+    UNION ALL
+    SELECT 'orders_columnar_lz4'  AS table_name, COUNT(*) AS row_count FROM orders_columnar_lz4
+    UNION ALL
+    SELECT 'orders_columnar_zstd' AS table_name, COUNT(*) AS row_count FROM orders_columnar_zstd
+) counts;
+
 SET max_parallel_workers_per_gather = 0;
 
 -- ============================================================

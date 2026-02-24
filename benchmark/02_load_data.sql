@@ -1,7 +1,7 @@
 -- =============================================================================
 -- pg_columnar benchmark – Step 2: Load test data
 --
--- Inserts ROW_COUNT rows into all four tables using generate_series().
+-- Inserts NUM_ROWS rows into all four tables using generate_series().
 -- Default: 1,000,000 rows  (~100 columnar stripes at the 10 000-row threshold)
 --
 -- The GUC columnar.compression is set to the appropriate value before each
@@ -9,16 +9,22 @@
 -- It is reset to 'none' at the end of the script.
 --
 -- Set the psql variable before running to override the row count, e.g.:
---   psql -v ROW_COUNT=500000 -f 02_load_data.sql
+--   psql -v NUM_ROWS=500000 -f 02_load_data.sql
+--
+-- NOTE: We intentionally use NUM_ROWS instead of ROW_COUNT.
+-- ROW_COUNT is a psql built-in variable that is automatically overwritten
+-- after every command with the number of rows affected by that command.
+-- Because SET commands affect 0 rows, using :ROW_COUNT after any SET would
+-- silently expand to 0 and cause generate_series(1, 0) to produce no rows.
 -- =============================================================================
 
 -- Default row count if the caller did not supply one
-\if :{?ROW_COUNT}
+\if :{?NUM_ROWS}
 \else
-  \set ROW_COUNT 1000000
+  \set NUM_ROWS 1000000
 \endif
 
-\echo '=== Loading :ROW_COUNT rows into orders_heap ==='
+\echo '=== Loading :NUM_ROWS rows into orders_heap ==='
 \timing on
 
 INSERT INTO orders_heap (
@@ -41,10 +47,36 @@ SELECT
     DATE '2020-01-01' + (gs % 1461)                      AS order_date,
     TIMESTAMP '2020-01-01' + (gs % 1461) * INTERVAL '1 day'
         + (gs % 86400) * INTERVAL '1 second'             AS created_at
-FROM generate_series(1, :ROW_COUNT) gs;
+FROM generate_series(1, :NUM_ROWS) gs;
+
+-- ---------------------------------------------------------------------------
+-- Load the pg_columnar library BEFORE any SET command references its GUC.
+--
+-- pg_columnar.so is loaded lazily: the first time a columnar relation is
+-- opened in a session, PostgreSQL calls GetTableAmRoutine(), which loads
+-- the library and runs _PG_init() – which registers the columnar.compression
+-- enum GUC.
+--
+-- The heap INSERT above does NOT open any columnar table, so in a fresh
+-- session the library is still absent at this point.  Calling
+--   SET columnar.compression = 'none'
+-- before the library is loaded either raises
+--   ERROR: unrecognized configuration parameter "columnar.compression"
+-- (aborting the script under ON_ERROR_STOP=1, so no columnar rows are ever
+-- inserted) or stores a bare string placeholder that is silently dropped
+-- when DefineCustomEnumVariable() later registers the enum type.
+--
+-- The zero-row SELECT below opens orders_columnar (empty at this point),
+-- which triggers the lazy library load and registers the GUC correctly so
+-- that every subsequent SET is applied as a typed enum value.
+-- ---------------------------------------------------------------------------
+\timing off
+\echo '=== Loading pg_columnar library (opening columnar relation) ==='
+SELECT COUNT(*) AS rows_in_orders_columnar_before_load FROM orders_columnar;
+\timing on
 
 -- columnar, no compression (default)
-\echo '=== Loading :ROW_COUNT rows into orders_columnar (none) ==='
+\echo '=== Loading :NUM_ROWS rows into orders_columnar (none) ==='
 SET columnar.compression = 'none';
 
 INSERT INTO orders_columnar (
@@ -67,10 +99,15 @@ SELECT
     DATE '2020-01-01' + (gs % 1461)                      AS order_date,
     TIMESTAMP '2020-01-01' + (gs % 1461) * INTERVAL '1 day'
         + (gs % 86400) * INTERVAL '1 second'             AS created_at
-FROM generate_series(1, :ROW_COUNT) gs;
+FROM generate_series(1, :NUM_ROWS) gs;
+
+\timing off
+\echo '--- orders_columnar row count (must equal :NUM_ROWS) ---'
+SELECT COUNT(*) AS inserted_rows FROM orders_columnar;
+\timing on
 
 -- columnar, LZ4 compression
-\echo '=== Loading :ROW_COUNT rows into orders_columnar_lz4 ==='
+\echo '=== Loading :NUM_ROWS rows into orders_columnar_lz4 ==='
 SET columnar.compression = 'lz4';
 
 INSERT INTO orders_columnar_lz4 (
@@ -93,10 +130,15 @@ SELECT
     DATE '2020-01-01' + (gs % 1461)                      AS order_date,
     TIMESTAMP '2020-01-01' + (gs % 1461) * INTERVAL '1 day'
         + (gs % 86400) * INTERVAL '1 second'             AS created_at
-FROM generate_series(1, :ROW_COUNT) gs;
+FROM generate_series(1, :NUM_ROWS) gs;
+
+\timing off
+\echo '--- orders_columnar_lz4 row count (must equal :NUM_ROWS) ---'
+SELECT COUNT(*) AS inserted_rows FROM orders_columnar_lz4;
+\timing on
 
 -- columnar, Zstandard compression
-\echo '=== Loading :ROW_COUNT rows into orders_columnar_zstd ==='
+\echo '=== Loading :NUM_ROWS rows into orders_columnar_zstd ==='
 SET columnar.compression = 'zstd';
 
 INSERT INTO orders_columnar_zstd (
@@ -119,7 +161,12 @@ SELECT
     DATE '2020-01-01' + (gs % 1461)                      AS order_date,
     TIMESTAMP '2020-01-01' + (gs % 1461) * INTERVAL '1 day'
         + (gs % 86400) * INTERVAL '1 second'             AS created_at
-FROM generate_series(1, :ROW_COUNT) gs;
+FROM generate_series(1, :NUM_ROWS) gs;
+
+\timing off
+\echo '--- orders_columnar_zstd row count (must equal :NUM_ROWS) ---'
+SELECT COUNT(*) AS inserted_rows FROM orders_columnar_zstd;
+\timing on
 
 -- Restore default so the session is clean for subsequent steps
 RESET columnar.compression;

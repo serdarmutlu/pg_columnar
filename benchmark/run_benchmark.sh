@@ -25,7 +25,7 @@ PG_HOST="${PGHOST:-localhost}"
 PG_PORT="${PGPORT:-5432}"
 PG_USER="${PGUSER:-$USER}"
 PG_DATABASE="${PGDATABASE:-postgres}"
-ROW_COUNT=1000000
+NUM_ROWS=1000000
 STEP="all"
 SKIP_SETUP=0
 SKIP_LOAD=0
@@ -42,7 +42,7 @@ while [[ $# -gt 0 ]]; do
         -p) PG_PORT="$2";     shift 2 ;;
         -U) PG_USER="$2";     shift 2 ;;
         -d) PG_DATABASE="$2"; shift 2 ;;
-        -n) ROW_COUNT="$2";   shift 2 ;;
+        -n) NUM_ROWS="$2";    shift 2 ;;
         -s) STEP="$2";        shift 2 ;;
         --skip-setup) SKIP_SETUP=1; shift ;;
         --skip-load)  SKIP_LOAD=1;  shift ;;
@@ -68,7 +68,7 @@ psql_run() {
         -p "$PG_PORT" \
         -U "$PG_USER" \
         -d "$PG_DATABASE" \
-        -v ROW_COUNT="$ROW_COUNT" \
+        -v NUM_ROWS="$NUM_ROWS" \
         -v ON_ERROR_STOP=1 \
         "$@"
 }
@@ -80,7 +80,7 @@ print_header() {
     echo " Host:     $PG_HOST:$PG_PORT"
     echo " Database: $PG_DATABASE"
     echo " User:     $PG_USER"
-    echo " Rows:     $ROW_COUNT"
+    echo " Rows:     $NUM_ROWS"
     echo " Log:      $LOG_FILE"
     echo "================================================================"
 }
@@ -97,7 +97,7 @@ run_all() {
     fi
 
     if [[ $SKIP_LOAD -eq 0 ]]; then
-        psql_run "Step 2 – Load $ROW_COUNT rows" \
+        psql_run "Step 2 – Load $NUM_ROWS rows" \
             -f "$SCRIPT_DIR/02_load_data.sql" | tee -a "$LOG_FILE"
     else
         echo "(Skipping data load)"
@@ -118,7 +118,7 @@ case "$STEP" in
         psql_run "Setup" -f "$SCRIPT_DIR/01_setup.sql" | tee -a "$LOG_FILE"
         ;;
     load)
-        psql_run "Load data ($ROW_COUNT rows)" \
+        psql_run "Load data ($NUM_ROWS rows)" \
             -f "$SCRIPT_DIR/02_load_data.sql" | tee -a "$LOG_FILE"
         ;;
     bench)

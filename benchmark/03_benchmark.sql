@@ -18,6 +18,32 @@
 --   Q10 Complex analytics (multiple aggregates by region & category)
 -- =============================================================================
 
+-- ---------------------------------------------------------------------------
+-- Pre-flight: verify every table has data before timing anything.
+-- An empty columnar table completes in < 0.1 ms regardless of query shape,
+-- making it appear orders of magnitude faster than heap.  That is NOT a
+-- valid benchmark result – it is simply scanning nothing.
+-- ---------------------------------------------------------------------------
+\timing off
+\echo '=== PRE-FLIGHT: row counts (all must be > 0 for valid results) ==='
+SELECT
+    table_name,
+    row_count,
+    CASE
+        WHEN row_count = 0
+        THEN '*** EMPTY – run 02_load_data.sql first; timings below are INVALID ***'
+        ELSE 'OK'
+    END AS status
+FROM (
+    SELECT 'orders_heap'          AS table_name, COUNT(*) AS row_count FROM orders_heap
+    UNION ALL
+    SELECT 'orders_columnar'      AS table_name, COUNT(*) AS row_count FROM orders_columnar
+    UNION ALL
+    SELECT 'orders_columnar_lz4'  AS table_name, COUNT(*) AS row_count FROM orders_columnar_lz4
+    UNION ALL
+    SELECT 'orders_columnar_zstd' AS table_name, COUNT(*) AS row_count FROM orders_columnar_zstd
+) counts;
+
 \timing on
 SET max_parallel_workers_per_gather = 0;  -- disable parallelism for fair comparison
 

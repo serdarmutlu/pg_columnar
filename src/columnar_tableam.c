@@ -322,11 +322,16 @@ columnar_scan_begin(Relation rel, Snapshot snapshot,
 	scan->wb_row_index = 0;
 
 	/*
-	 * Parallel scans are not yet supported.  Only the leader process
-	 * should scan stripes; parallel workers return no rows to prevent
-	 * duplicate results.
+	 * For a coordinated Parallel Sequential Scan (pscan != NULL), only
+	 * the leader should scan stripes; workers return no rows to prevent
+	 * duplicate results, because the leader will cover the full table.
+	 *
+	 * For a Parallel Append query (pscan == NULL even when
+	 * IsParallelWorker() is true), each sub-plan is assigned to exactly
+	 * one process with no overlap, so parallel workers must scan their
+	 * assigned table normally.
 	 */
-	if (IsParallelWorker())
+	if (IsParallelWorker() && pscan != NULL)
 	{
 		scan->num_stripes = 0;
 		scan->stripe_meta = NULL;
