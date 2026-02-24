@@ -189,18 +189,26 @@ Data is stored under `$PGDATA/columnar/<dbOid>/<relNumber>/`:
 
 ```
 $PGDATA/columnar/16384/16421/
-    metadata                      # stripe index (count, row counts, sizes)
+    metadata                      # stripe index (count, row counts, sizes, compression)
     stripe_000001.arrow           # Arrow IPC stream (one RecordBatch)
     stripe_000001.deleted         # delete bitmap — only present if rows were deleted
+    stripe_000001.stats           # per-column min/max statistics for stripe pruning
     stripe_000002.arrow
+    stripe_000002.deleted
+    stripe_000002.stats
     ...
 ```
 
-Rows are buffered in memory and flushed to a new stripe file every 10,000 rows or at transaction commit.
+Rows are buffered in memory and flushed to a new stripe file every 10,000 rows or at
+transaction commit.
 
 The `.deleted` file is a packed bitset (`ceil(row_count / 8)` bytes). Bit `i` set means
 row `i` within that stripe is logically deleted. After VACUUM, fully-deleted stripes have
-their `.arrow` and `.deleted` files removed from disk.
+their `.arrow`, `.deleted`, and `.stats` files removed from disk.
+
+The `.stats` file records the per-column min/max values for the stripe (integers, dates,
+timestamps, and floats). It is used by the stripe pruning layer to skip stripes that
+cannot possibly match a query's filter conditions.
 
 ## Reading Stripes Externally
 
@@ -230,6 +238,33 @@ Index scans work correctly, including after DELETE and UPDATE operations. Indexe
 created before or after data is loaded.
 
 Note: index-only scans are not supported — the access method always fetches the full tuple.
+
+## Performance
+
+### Stripe pruning
+
+Each stripe carries a companion `.stats` file with per-column min/max values for
+integer, date, timestamp, and float columns. When a scan includes explicit filter
+conditions (passed as `ScanKeyData`), stripes whose value ranges cannot possibly
+satisfy the filter are skipped entirely — no file is opened and no rows are read.
+
+For example, if a table has 100 stripes of 10,000 rows each and a filter matches
+only one stripe's range, 99 stripes are skipped with no I/O.
+
+### In-memory caches
+
+Three backend-local in-memory caches eliminate repeated file I/O within a session:
+
+| Cache | Key | Eliminates |
+|---|---|---|
+| Metadata cache | `(dbOid, relNumber)` | One metadata file read per TID during index scans |
+| Stats cache | `(dbOid, relNumber, stripe_id)` | One `.stats` file read per stripe per scan |
+
+Both caches are backend-local (not shared across connections) and are automatically
+invalidated on `DROP TABLE`, `TRUNCATE`, and `VACUUM`.
+
+The stats cache also stores a **"file absent" marker** for stripes that pre-date the
+statistics feature, so repeated scans of older tables do not retry failed `fopen` calls.
 
 ## Current Limitations
 

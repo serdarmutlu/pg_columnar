@@ -123,7 +123,7 @@ before the first SET.
 
 ## Caching Architecture
 
-Three caching / optimization levels are implemented:
+Three caching / optimization levels are fully implemented; a fourth is planned:
 
 ### Level 1 — Backend-local Metadata Cache (implemented)
 
@@ -166,10 +166,58 @@ Level 4 (custom scan node), which will pass explicit scan keys.
 **VACUUM integration:** `columnar_relation_vacuum` removes the `.stats` file for fully-
 deleted stripes alongside `.arrow` and `.deleted`.
 
+### Level 3b — Per-stripe Stats In-memory Cache (implemented)
+
+`columnar_read_stripe_stats` previously opened and parsed the `.stats` file from disk on
+every call — one `fopen` + parse per stripe per invocation of `columnar_stripe_should_skip`.
+For a table with N stripes, every scan with active scan keys incurred N file reads.
+Stripe stats are write-once and immutable (stripes are never modified after flush), so
+caching them is both safe and highly effective.
+
+**Cache key:** `(dbOid, relNumber, stripe_id)` — the three fields needed to uniquely
+identify a stripe's stats file.
+
+**Cache storage:** backend-local `HTAB` (`stats_cache`) in a dedicated
+`MemoryContext` (`stats_cache_ctx`) rooted at `TopMemoryContext`. The `cols[]` array
+inside each entry is palloc'd in `stats_cache_ctx` so it outlives individual queries.
+
+**Hit path:** returns a `palloc`'d copy of the cached `ColumnarStripeStats` in
+`CurrentMemoryContext`; zero file I/O.
+
+**`file_absent` marker:** when `fopen` fails with `ENOENT` (pre-Level-3 stripe or
+already-vacuumed stripe), a cache entry is recorded with `file_absent = true`. Subsequent
+calls return `NULL` immediately without attempting another `fopen`. This avoids repeated
+syscall overhead for old tables that pre-date Level 3.
+
+**`ncols` mismatch:** if a cached entry's `ncols` doesn't match `expected_ncols` (which
+can happen after `ALTER TABLE ADD/DROP COLUMN`), the cache returns `NULL` and lets pruning
+be silently skipped — no stale stats are used for the schema-mismatched stripe.
+
+**Update points:**
+- `columnar_write_stripe_stats` — populates the cache immediately after a successful write.
+- `columnar_read_stripe_stats` (cache-miss path) — populates after a successful file read,
+  or records `file_absent = true` after a confirmed `ENOENT`.
+
+**Eviction:**
+- `columnar_stats_cache_evict_stripe(locator, stripe_id)` — evicts a single stripe entry.
+  Declared `extern` in `columnar_storage.h`; called from `columnar_relation_vacuum` after
+  the `.stats` file is unlinked for a fully-deleted stripe.
+- `columnar_stats_cache_evict_relation(locator)` — evicts all entries for a relation
+  (static, called from `columnar_remove_storage` on DROP TABLE / TRUNCATE). Uses a
+  collect-then-delete loop since HTAB iteration and deletion cannot be safely interleaved.
+
+**Net effect:** for a table with N stripes, `columnar_stripe_should_skip` goes from
+N `fopen` + parse calls per scan to zero file I/O after the first scan warms the cache.
+
 ### Level 4 — Columnar Buffer Pool (planned)
 
-Custom scan node + shared stripe cache.  Supersedes Level 2 (shared stripe cache alone).
-Not yet implemented.
+Custom scan node + shared stripe RecordBatch cache.  Supersedes Level 2 (shared stripe
+cache alone). Not yet implemented.
+
+The custom scan node is the key enabler: it will extract WHERE-clause quals at plan time
+and pass them as explicit `ScanKeyData` to `columnar_scan_begin`, allowing
+`columnar_stripe_should_skip` (Level 3) to prune stripes for all ordinary queries —
+not just callers that set `rs_nkeys > 0` manually.
 
 ---
 
