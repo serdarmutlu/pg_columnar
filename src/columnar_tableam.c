@@ -14,6 +14,7 @@
 #include "utils/date.h"
 #include "utils/rel.h"
 #include "utils/sampling.h"
+#include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
 #ifdef HAVE_LIBZSTD
@@ -1023,6 +1024,27 @@ columnar_index_fetch_tuple(struct IndexFetchTableData *scan,
 	*call_again = false;
 	if (all_dead)
 		*all_dead = false;
+
+	/*
+	 * When called with SNAPSHOT_DIRTY (by btree _bt_check_unique), we must
+	 * populate snapshot->xmin/xmax to tell the caller about transaction
+	 * visibility.  PG17's InitDirtySnapshot only sets snapshot_type and
+	 * leaves xmin/xmax uninitialized; heap fills them via
+	 * HeapTupleSatisfiesDirty.  If we leave them as stack garbage the btree
+	 * loop treats the garbage as an in-progress XID to wait for, spins
+	 * forever, and never raises the duplicate-key error.
+	 *
+	 * Columnar has no MVCC: every row is either committed-and-live or
+	 * logically deleted (delete bitmap).  We handle the deleted case by
+	 * returning false below.  For a live row we signal "committed, no
+	 * in-progress transaction" by setting both to InvalidTransactionId.
+	 */
+	if (snapshot != NULL && snapshot->snapshot_type == SNAPSHOT_DIRTY)
+	{
+		snapshot->xmin = InvalidTransactionId;
+		snapshot->xmax = InvalidTransactionId;
+		snapshot->speculativeToken = 0;
+	}
 
 	ExecClearTuple(slot);
 
