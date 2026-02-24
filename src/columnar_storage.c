@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include "miscadmin.h"
+#include "utils/hsearch.h"
 #include "utils/memutils.h"
 
 #include <dirent.h>
@@ -28,6 +29,150 @@
  * For backward compatibility, the reader also accepts the old 3-field format
  * (stripe_id row_count file_size) and defaults compression to NONE.
  */
+
+/* ----------------------------------------------------------------
+ * Backend-local metadata cache
+ *
+ * Avoids re-reading the metadata file on every columnar_read_metadata()
+ * call.  The primary beneficiary is columnar_index_fetch_tuple(), which
+ * is invoked for every TID during an index scan and previously incurred
+ * a full metadata-file read per call.  columnar_tuple_delete() and
+ * columnar_relation_estimate_size() also benefit.
+ *
+ * Key:   (dbOid, relNumber) — the two fields used to build the columnar
+ *        directory path, matching PG_LOCATOR_DB/REL.
+ * Value: full copy of ColumnarMetadata (num_stripes, total_rows, stripes[]).
+ *
+ * Invalidation rules:
+ *   columnar_write_metadata() updates the cache after every successful
+ *   write, keeping it in sync with the on-disk file for this backend.
+ *
+ *   columnar_remove_storage() evicts the entry when a table is dropped
+ *   or truncated.
+ *
+ * Cross-backend consistency: the cache is intentionally backend-local and
+ * does not handle concurrent modifications from other backends, matching
+ * the existing no-MVCC stance of the columnar TAM.
+ * ----------------------------------------------------------------
+ */
+
+typedef struct ColumnarMetadataCacheKey
+{
+	Oid			dbOid;		/* PG_LOCATOR_DB value */
+	Oid			relNumber;	/* PG_LOCATOR_REL value (Oid on all PG versions) */
+} ColumnarMetadataCacheKey;
+
+typedef struct ColumnarMetadataCacheEntry
+{
+	ColumnarMetadataCacheKey key;	/* MUST be first for HTAB */
+	int			num_stripes;
+	int64_t		total_rows;
+	StripeMetadata *stripes;		/* palloc'd in metadata_cache_ctx; NULL if 0 stripes */
+} ColumnarMetadataCacheEntry;
+
+static HTAB *metadata_cache = NULL;
+static MemoryContext metadata_cache_ctx = NULL;
+
+/*
+ * Initialize the metadata cache.  Called lazily on first use.
+ */
+static void
+columnar_metadata_cache_init(void)
+{
+	HASHCTL		ctl;
+
+	metadata_cache_ctx = AllocSetContextCreate(TopMemoryContext,
+											   "columnar metadata cache",
+											   ALLOCSET_SMALL_SIZES);
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(ColumnarMetadataCacheKey);
+	ctl.entrysize = sizeof(ColumnarMetadataCacheEntry);
+	ctl.hcxt = metadata_cache_ctx;
+
+	metadata_cache = hash_create("columnar metadata cache",
+								 16,	/* initial capacity; grows automatically */
+								 &ctl,
+								 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+/*
+ * Insert or overwrite a metadata cache entry.
+ *
+ * Called after every successful metadata file read (cache miss path) and
+ * after every metadata file write, so the cache always reflects the latest
+ * on-disk state for this backend.
+ */
+static void
+columnar_metadata_cache_update(const RelFileLocator *locator,
+							   const ColumnarMetadata *meta)
+{
+	ColumnarMetadataCacheKey key;
+	ColumnarMetadataCacheEntry *entry;
+	bool		found;
+	MemoryContext oldcxt;
+
+	if (metadata_cache == NULL)
+		columnar_metadata_cache_init();
+
+	key.dbOid = (Oid) PG_LOCATOR_DB(locator);
+	key.relNumber = (Oid) PG_LOCATOR_REL(locator);
+
+	entry = hash_search(metadata_cache, &key, HASH_ENTER, &found);
+
+	/* Discard the old stripes array when overwriting an existing entry */
+	if (found && entry->stripes != NULL)
+	{
+		pfree(entry->stripes);
+		entry->stripes = NULL;
+	}
+
+	entry->num_stripes = meta->num_stripes;
+	entry->total_rows = meta->total_rows;
+
+	if (meta->num_stripes > 0 && meta->stripes != NULL)
+	{
+		/* Allocate in the long-lived cache context so it outlives the query */
+		oldcxt = MemoryContextSwitchTo(metadata_cache_ctx);
+		entry->stripes = palloc(sizeof(StripeMetadata) * meta->num_stripes);
+		MemoryContextSwitchTo(oldcxt);
+		memcpy(entry->stripes, meta->stripes,
+			   sizeof(StripeMetadata) * meta->num_stripes);
+	}
+	else
+		entry->stripes = NULL;
+}
+
+/*
+ * Remove a metadata cache entry.
+ *
+ * Called when the underlying storage is removed (DROP TABLE, TRUNCATE) so
+ * the cache cannot return stale data for a future table that reuses the
+ * same relfilenode.
+ */
+static void
+columnar_metadata_cache_evict(const RelFileLocator *locator)
+{
+	ColumnarMetadataCacheKey key;
+	ColumnarMetadataCacheEntry *entry;
+	bool		found;
+
+	if (metadata_cache == NULL)
+		return;					/* cache not yet initialised; nothing to evict */
+
+	key.dbOid = (Oid) PG_LOCATOR_DB(locator);
+	key.relNumber = (Oid) PG_LOCATOR_REL(locator);
+
+	/* Free the stripes array before removing the HTAB entry to avoid a leak */
+	entry = hash_search(metadata_cache, &key, HASH_FIND, &found);
+	if (found && entry->stripes != NULL)
+	{
+		pfree(entry->stripes);
+		entry->stripes = NULL;
+	}
+
+	hash_search(metadata_cache, &key, HASH_REMOVE, NULL);
+}
 
 char *
 columnar_dir_path(const RelFileLocator *locator)
@@ -116,6 +261,16 @@ columnar_remove_storage(const RelFileLocator *locator)
 	DIR		   *dir;
 	struct dirent *de;
 
+	/*
+	 * Evict before touching the files so that any subsequent
+	 * columnar_read_metadata call for this locator is forced back to disk
+	 * (or gets an empty result for a freshly-created replacement table).
+	 * We evict unconditionally — even if the directory does not exist —
+	 * because the cache might still hold a stale entry from a previous
+	 * incarnation of the same relfilenode.
+	 */
+	columnar_metadata_cache_evict(locator);
+
 	dir = opendir(dirpath);
 	if (dir == NULL)
 	{
@@ -142,17 +297,53 @@ columnar_remove_storage(const RelFileLocator *locator)
 ColumnarMetadata *
 columnar_read_metadata(const RelFileLocator *locator)
 {
-	char	   *metapath = columnar_metadata_path(locator);
+	char	   *metapath;
 	FILE	   *fp;
 	ColumnarMetadata *meta;
 	int			i;
 
+	/*
+	 * Cache lookup.  On a hit, return a palloc'd copy so the caller can
+	 * pfree it in the usual way without disturbing the cached state.
+	 */
+	{
+		ColumnarMetadataCacheKey ckey;
+		ColumnarMetadataCacheEntry *centry;
+		bool		found;
+
+		if (metadata_cache == NULL)
+			columnar_metadata_cache_init();
+
+		ckey.dbOid = (Oid) PG_LOCATOR_DB(locator);
+		ckey.relNumber = (Oid) PG_LOCATOR_REL(locator);
+
+		centry = hash_search(metadata_cache, &ckey, HASH_FIND, &found);
+		if (found)
+		{
+			ColumnarMetadata *result = palloc(sizeof(ColumnarMetadata));
+
+			result->num_stripes = centry->num_stripes;
+			result->total_rows = centry->total_rows;
+			if (centry->num_stripes > 0 && centry->stripes != NULL)
+			{
+				result->stripes = palloc(sizeof(StripeMetadata) * centry->num_stripes);
+				memcpy(result->stripes, centry->stripes,
+					   sizeof(StripeMetadata) * centry->num_stripes);
+			}
+			else
+				result->stripes = NULL;
+			return result;
+		}
+	}
+
+	/* Cache miss — read from the metadata file on disk. */
+	metapath = columnar_metadata_path(locator);
 	meta = palloc0(sizeof(ColumnarMetadata));
 
 	fp = fopen(metapath, "r");
 	if (fp == NULL)
 	{
-		/* No metadata file yet -- return empty */
+		/* No metadata file yet -- return empty (do not cache; no valid data) */
 		pfree(metapath);
 		return meta;
 	}
@@ -163,6 +354,7 @@ columnar_read_metadata(const RelFileLocator *locator)
 		if (fgets(header_line, sizeof(header_line), fp) == NULL ||
 			sscanf(header_line, "%d %" SCNd64, &meta->num_stripes, &meta->total_rows) != 2)
 		{
+			/* Unparseable header — return what we have, do not cache */
 			fclose(fp);
 			pfree(metapath);
 			return meta;
@@ -205,6 +397,10 @@ columnar_read_metadata(const RelFileLocator *locator)
 
 	fclose(fp);
 	pfree(metapath);
+
+	/* Populate the cache so subsequent calls for this table are served from RAM */
+	columnar_metadata_cache_update(locator, meta);
+
 	return meta;
 }
 
@@ -234,6 +430,14 @@ columnar_write_metadata(const RelFileLocator *locator, ColumnarMetadata *meta)
 
 	fclose(fp);
 	pfree(metapath);
+
+	/*
+	 * Keep the backend-local cache in sync with what we just wrote.
+	 * This is the single update point: every on-disk metadata change
+	 * goes through columnar_write_metadata, so updating here is sufficient
+	 * to maintain cache consistency within this backend.
+	 */
+	columnar_metadata_cache_update(locator, meta);
 }
 
 void
