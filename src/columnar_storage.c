@@ -174,6 +174,219 @@ columnar_metadata_cache_evict(const RelFileLocator *locator)
 	hash_search(metadata_cache, &key, HASH_REMOVE, NULL);
 }
 
+/* ----------------------------------------------------------------
+ * Backend-local per-stripe statistics cache
+ *
+ * Stripe stats (.stats files) are written once at flush time and never
+ * modified afterward (stripes are write-once / immutable).  Caching
+ * them avoids one fopen+parse per stripe per call to
+ * columnar_stripe_should_skip().
+ *
+ * Key:   (dbOid, relNumber, stripe_id)
+ * Value: copy of ColumnarStripeStats, or a "file absent" marker.
+ *
+ * Invalidation rules:
+ *   columnar_stats_cache_evict_stripe() — called from VACUUM when a
+ *   fully-deleted stripe's .stats file is removed.
+ *
+ *   columnar_stats_cache_evict_relation() — called from
+ *   columnar_remove_storage() on DROP TABLE / TRUNCATE.
+ *
+ * The "file absent" marker caches the fact that a .stats file does not
+ * exist for a stripe (e.g. stripes written before Level-3 was installed).
+ * This avoids repeated fopen() failures for every stripe on every scan.
+ * ----------------------------------------------------------------
+ */
+
+typedef struct ColumnarStatsCacheKey
+{
+	Oid			dbOid;
+	Oid			relNumber;
+	int			stripe_id;
+	/* no padding needed: 3 × 4 bytes = 12 bytes, naturally aligned */
+} ColumnarStatsCacheKey;
+
+typedef struct ColumnarStatsCacheEntry
+{
+	ColumnarStatsCacheKey key;			/* MUST be first for HTAB */
+	bool		file_absent;			/* true = .stats file confirmed missing */
+	int			ncols;
+	ColumnarColumnStats *cols;			/* palloc'd in stats_cache_ctx; NULL if ncols==0 */
+} ColumnarStatsCacheEntry;
+
+static HTAB *stats_cache = NULL;
+static MemoryContext stats_cache_ctx = NULL;
+
+/*
+ * Initialise the stats cache lazily on first use.
+ */
+static void
+columnar_stats_cache_init(void)
+{
+	HASHCTL		ctl;
+
+	stats_cache_ctx = AllocSetContextCreate(TopMemoryContext,
+											"columnar stats cache",
+											ALLOCSET_SMALL_SIZES);
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(ColumnarStatsCacheKey);
+	ctl.entrysize = sizeof(ColumnarStatsCacheEntry);
+	ctl.hcxt = stats_cache_ctx;
+
+	stats_cache = hash_create("columnar stats cache",
+							  64,	/* initial buckets; grows automatically */
+							  &ctl,
+							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+/*
+ * Insert or overwrite a stats cache entry.
+ *
+ * Pass stats=NULL to record that the .stats file is absent for this stripe
+ * (avoids repeated fopen() failures for pre-Level-3 stripes).
+ * Pass a valid ColumnarStripeStats pointer to cache the parsed stats.
+ *
+ * Called after every successful stats file write and after every
+ * successful stats file read (cache-miss path).
+ */
+static void
+columnar_stats_cache_update(const RelFileLocator *locator,
+							int stripe_id,
+							const ColumnarStripeStats *stats)
+{
+	ColumnarStatsCacheKey key;
+	ColumnarStatsCacheEntry *entry;
+	bool		found;
+	MemoryContext oldcxt;
+
+	if (stats_cache == NULL)
+		columnar_stats_cache_init();
+
+	memset(&key, 0, sizeof(key));
+	key.dbOid = (Oid) PG_LOCATOR_DB(locator);
+	key.relNumber = (Oid) PG_LOCATOR_REL(locator);
+	key.stripe_id = stripe_id;
+
+	entry = hash_search(stats_cache, &key, HASH_ENTER, &found);
+
+	/* Free previous cols array when overwriting */
+	if (found && entry->cols != NULL)
+	{
+		pfree(entry->cols);
+		entry->cols = NULL;
+	}
+
+	if (stats == NULL)
+	{
+		/* Record that the file is absent */
+		entry->file_absent = true;
+		entry->ncols = 0;
+		entry->cols = NULL;
+		return;
+	}
+
+	entry->file_absent = false;
+	entry->ncols = stats->ncols;
+
+	if (stats->ncols > 0 && stats->cols != NULL)
+	{
+		oldcxt = MemoryContextSwitchTo(stats_cache_ctx);
+		entry->cols = palloc(sizeof(ColumnarColumnStats) * stats->ncols);
+		MemoryContextSwitchTo(oldcxt);
+		memcpy(entry->cols, stats->cols,
+			   sizeof(ColumnarColumnStats) * stats->ncols);
+	}
+	else
+		entry->cols = NULL;
+}
+
+/*
+ * Evict the stats cache entry for a single stripe.
+ *
+ * Called from columnar_relation_vacuum() when a fully-deleted stripe's
+ * .stats file is removed from disk.  Declared extern so columnar_tableam.c
+ * can call it directly.
+ */
+void
+columnar_stats_cache_evict_stripe(const RelFileLocator *locator, int stripe_id)
+{
+	ColumnarStatsCacheKey key;
+	ColumnarStatsCacheEntry *entry;
+	bool		found;
+
+	if (stats_cache == NULL)
+		return;
+
+	memset(&key, 0, sizeof(key));
+	key.dbOid = (Oid) PG_LOCATOR_DB(locator);
+	key.relNumber = (Oid) PG_LOCATOR_REL(locator);
+	key.stripe_id = stripe_id;
+
+	entry = hash_search(stats_cache, &key, HASH_FIND, &found);
+	if (found && entry->cols != NULL)
+	{
+		pfree(entry->cols);
+		entry->cols = NULL;
+	}
+	hash_search(stats_cache, &key, HASH_REMOVE, NULL);
+}
+
+/*
+ * Evict all stats cache entries for a relation.
+ *
+ * Called from columnar_remove_storage() on DROP TABLE / TRUNCATE.
+ * Since the cache key includes stripe_id we cannot do a single
+ * HASH_REMOVE; instead we collect all matching keys then delete them.
+ */
+static void
+columnar_stats_cache_evict_relation(const RelFileLocator *locator)
+{
+	Oid			target_db = (Oid) PG_LOCATOR_DB(locator);
+	Oid			target_rel = (Oid) PG_LOCATOR_REL(locator);
+	HASH_SEQ_STATUS seq;
+	ColumnarStatsCacheEntry *entry;
+	ColumnarStatsCacheKey *keys;
+	int			nkeys = 0;
+	int			maxkeys = 64;
+	int			i;
+
+	if (stats_cache == NULL)
+		return;
+
+	keys = palloc(sizeof(ColumnarStatsCacheKey) * maxkeys);
+
+	hash_seq_init(&seq, stats_cache);
+	while ((entry = (ColumnarStatsCacheEntry *) hash_seq_search(&seq)) != NULL)
+	{
+		if (entry->key.dbOid != target_db || entry->key.relNumber != target_rel)
+			continue;
+
+		if (nkeys >= maxkeys)
+		{
+			maxkeys *= 2;
+			keys = repalloc(keys, sizeof(ColumnarStatsCacheKey) * maxkeys);
+		}
+		keys[nkeys++] = entry->key;
+	}
+	/* seq scan ran to completion (returned NULL); no need for hash_seq_term */
+
+	for (i = 0; i < nkeys; i++)
+	{
+		bool		found;
+
+		entry = hash_search(stats_cache, &keys[i], HASH_FIND, &found);
+		if (found && entry->cols != NULL)
+		{
+			pfree(entry->cols);
+			entry->cols = NULL;
+		}
+		hash_search(stats_cache, &keys[i], HASH_REMOVE, NULL);
+	}
+
+	pfree(keys);
+}
+
 char *
 columnar_dir_path(const RelFileLocator *locator)
 {
@@ -262,14 +475,15 @@ columnar_remove_storage(const RelFileLocator *locator)
 	struct dirent *de;
 
 	/*
-	 * Evict before touching the files so that any subsequent
-	 * columnar_read_metadata call for this locator is forced back to disk
-	 * (or gets an empty result for a freshly-created replacement table).
+	 * Evict both caches before touching the files so that any subsequent
+	 * read call for this locator is forced back to disk (or gets an empty
+	 * result for a freshly-created replacement table).
 	 * We evict unconditionally — even if the directory does not exist —
-	 * because the cache might still hold a stale entry from a previous
+	 * because the caches might still hold stale entries from a previous
 	 * incarnation of the same relfilenode.
 	 */
 	columnar_metadata_cache_evict(locator);
+	columnar_stats_cache_evict_relation(locator);
 
 	dir = opendir(dirpath);
 	if (dir == NULL)
@@ -639,13 +853,20 @@ columnar_write_stripe_stats(const RelFileLocator *locator, int stripe_id,
 
 	fclose(fp);
 	pfree(path);
+
+	/*
+	 * Keep the backend-local cache in sync with the file we just wrote.
+	 * Stats are immutable once written, so this entry will be valid for
+	 * the lifetime of the stripe.
+	 */
+	columnar_stats_cache_update(locator, stripe_id, stats);
 }
 
 ColumnarStripeStats *
 columnar_read_stripe_stats(const RelFileLocator *locator,
 						   int stripe_id, int expected_ncols)
 {
-	char	   *path = columnar_stats_path(locator, stripe_id);
+	char	   *path;
 	FILE	   *fp;
 	ColumnarStripeStats *stats;
 	char		header[64];
@@ -653,10 +874,66 @@ columnar_read_stripe_stats(const RelFileLocator *locator,
 				ncols;
 	int			i;
 
+	/*
+	 * Cache lookup.  On a hit we return a palloc'd copy so the caller
+	 * can pfree it in the usual way without disturbing the cached state.
+	 */
+	{
+		ColumnarStatsCacheKey ckey;
+		ColumnarStatsCacheEntry *centry;
+		bool		found;
+
+		if (stats_cache == NULL)
+			columnar_stats_cache_init();
+
+		memset(&ckey, 0, sizeof(ckey));
+		ckey.dbOid = (Oid) PG_LOCATOR_DB(locator);
+		ckey.relNumber = (Oid) PG_LOCATOR_REL(locator);
+		ckey.stripe_id = stripe_id;
+
+		centry = hash_search(stats_cache, &ckey, HASH_FIND, &found);
+		if (found)
+		{
+			/* File confirmed absent (pre-Level-3 stripe) */
+			if (centry->file_absent)
+				return NULL;
+
+			/* Schema mismatch after ALTER TABLE ADD/DROP COLUMN */
+			if (centry->ncols != expected_ncols)
+				return NULL;
+
+			/* Return a palloc'd copy; caller may pfree it freely */
+			{
+				ColumnarStripeStats *result = palloc(sizeof(ColumnarStripeStats));
+
+				result->ncols = centry->ncols;
+				if (centry->ncols > 0 && centry->cols != NULL)
+				{
+					result->cols = palloc(sizeof(ColumnarColumnStats) * centry->ncols);
+					memcpy(result->cols, centry->cols,
+						   sizeof(ColumnarColumnStats) * centry->ncols);
+				}
+				else
+					result->cols = NULL;
+				return result;
+			}
+		}
+	}
+
+	/* Cache miss — read the .stats file from disk */
+	path = columnar_stats_path(locator, stripe_id);
 	fp = fopen(path, "r");
 	pfree(path);
 	if (fp == NULL)
-		return NULL;			/* no stats file */
+	{
+		/*
+		 * File absent (pre-Level-3 stripe or already vacuumed).  Cache
+		 * the absence so subsequent calls skip the fopen() entirely.
+		 */
+		if (errno == ENOENT)
+			columnar_stats_cache_update(locator, stripe_id, NULL);
+		return NULL;
+	}
 
 	/* Validate header: "PGCS <version> <ncols>" */
 	if (fgets(header, sizeof(header), fp) == NULL ||
@@ -707,6 +984,14 @@ columnar_read_stripe_stats(const RelFileLocator *locator,
 	}
 
 	fclose(fp);
+
+	/*
+	 * Populate the cache so subsequent calls for this stripe are served
+	 * from RAM.  Stats are immutable once written; the entry stays valid
+	 * until the stripe is vacuumed (fully deleted).
+	 */
+	columnar_stats_cache_update(locator, stripe_id, stats);
+
 	return stats;
 }
 

@@ -1747,6 +1747,14 @@ columnar_relation_vacuum(Relation rel, struct VacuumParams *params,
 			pfree(del_path);
 			pfree(stats_path);
 
+			/*
+			 * Evict the stats cache entry for this stripe so that
+			 * subsequent scans do not find stale data in memory.
+			 * (The entry is safe to leave — row_count=0 prevents it from
+			 * being accessed — but evicting keeps memory clean.)
+			 */
+			columnar_stats_cache_evict_stripe(locator, sm->stripe_id);
+
 			sm->row_count = 0;
 			sm->file_size = 0;
 			sm->uncompressed_size = 0;

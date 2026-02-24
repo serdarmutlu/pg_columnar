@@ -222,4 +222,12 @@ extern ColumnarStripeStats *columnar_read_stripe_stats(const RelFileLocator *loc
  */
 extern void columnar_free_stripe_stats(ColumnarStripeStats *stats);
 
+/*
+ * Evict the stats cache entry for a single stripe.
+ * Called from columnar_relation_vacuum() when the .stats file is removed
+ * for a fully-deleted stripe.
+ */
+extern void columnar_stats_cache_evict_stripe(const RelFileLocator *locator,
+											  int stripe_id);
+
 #endif /* COLUMNAR_STORAGE_H */
