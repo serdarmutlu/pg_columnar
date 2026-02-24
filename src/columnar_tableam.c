@@ -511,6 +511,15 @@ columnar_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
 		/* Try to open the next stripe */
 		if (scan->current_stripe < scan->num_stripes)
 		{
+			/*
+			 * Skip stripes that were fully vacuumed (row_count == 0).
+			 * Their files have been removed; there is nothing to read.
+			 */
+			if (scan->stripe_meta[scan->current_stripe].row_count == 0)
+			{
+				scan->current_stripe++;
+				continue;
+			}
 			columnar_open_stripe(scan, scan->current_stripe);
 			scan->current_stripe++;
 			continue;
@@ -960,6 +969,20 @@ columnar_index_fetch_tuple(struct IndexFetchTableData *scan,
 	if ((int) stripe_1based < 1 || (int) stripe_1based > num_stripes)
 	{
 		/* TID out of range */
+		if (meta->stripes)
+			pfree(meta->stripes);
+		pfree(meta);
+		return false;
+	}
+
+	/*
+	 * Guard against stripes that were fully vacuumed (row_count == 0).
+	 * Their files have been removed, so attempting to open them would
+	 * fail.  Any index entries that still reference these TIDs are stale
+	 * dead entries; returning false tells the executor to skip them.
+	 */
+	if (meta->stripes[stripe_1based - 1].row_count == 0)
+	{
 		if (meta->stripes)
 			pfree(meta->stripes);
 		pfree(meta);
@@ -1430,7 +1453,121 @@ static void
 columnar_relation_vacuum(Relation rel, struct VacuumParams *params,
 						 BufferAccessStrategy bstrategy)
 {
-	/* no-op for Phase 1 */
+	const RelFileLocator *locator = RelationGetLocator(rel);
+	ColumnarMetadata *meta;
+	int64_t		new_total_rows = 0;
+	bool		any_changes = false;
+	int			i;
+
+	meta = columnar_read_metadata(locator);
+	if (meta->num_stripes == 0)
+	{
+		pfree(meta);
+		return;
+	}
+
+	for (i = 0; i < meta->num_stripes; i++)
+	{
+		StripeMetadata *sm = &meta->stripes[i];
+		uint8_t    *del_bits;
+		int64_t		del_count;
+		int64_t		j;
+
+		CHECK_FOR_INTERRUPTS();
+
+		if (sm->row_count == 0)
+			continue;			/* already vacuumed in a previous pass */
+
+		del_bits = columnar_read_delete_bitmap(locator,
+											   sm->stripe_id, sm->row_count);
+
+		if (del_bits == NULL)
+		{
+			/* No deletions in this stripe */
+			new_total_rows += sm->row_count;
+			continue;
+		}
+
+		/* Count deleted rows */
+		del_count = 0;
+		for (j = 0; j < sm->row_count; j++)
+		{
+			if (columnar_is_deleted(del_bits, j))
+				del_count++;
+		}
+		pfree(del_bits);
+
+		if (del_count == 0)
+		{
+			/*
+			 * Bitmap file exists but contains no set bits — stale file.
+			 * Remove it and carry on.
+			 */
+			char	   *del_path = columnar_deleted_path(locator, sm->stripe_id);
+
+			(void) unlink(del_path);
+			pfree(del_path);
+			new_total_rows += sm->row_count;
+			continue;
+		}
+
+		if (del_count == sm->row_count)
+		{
+			/*
+			 * Every row in this stripe is deleted.  Reclaim the disk space
+			 * by removing the stripe file and its delete bitmap.  Mark the
+			 * stripe as empty in metadata (row_count = 0); we keep the
+			 * entry in the stripes array so that TID block-numbers for
+			 * subsequent stripes do not shift, which would invalidate
+			 * existing index entries.
+			 */
+			char	   *stripe_path = columnar_stripe_path(locator, sm->stripe_id);
+			char	   *del_path = columnar_deleted_path(locator, sm->stripe_id);
+
+			(void) unlink(stripe_path);
+			(void) unlink(del_path);
+			pfree(stripe_path);
+			pfree(del_path);
+
+			sm->row_count = 0;
+			sm->file_size = 0;
+			sm->uncompressed_size = 0;
+			any_changes = true;
+			/* new_total_rows not incremented: no surviving rows */
+		}
+		else
+		{
+			/*
+			 * Partial deletion: some rows survive, some are deleted.
+			 * We intentionally do NOT rewrite the stripe file because
+			 * doing so would shift the row offsets of surviving rows and
+			 * invalidate the TIDs held by existing indexes.  The delete
+			 * bitmap remains in place so that scans and index fetches
+			 * continue to skip deleted rows correctly.
+			 *
+			 * Full rewriting with index rebuilding is a future Phase 3
+			 * enhancement.
+			 */
+			new_total_rows += (sm->row_count - del_count);
+		}
+	}
+
+	/*
+	 * Update total_rows if it changed.  This keeps columnar_relation_estimate_size
+	 * accurate for the query planner without requiring ANALYZE.
+	 */
+	if (new_total_rows != meta->total_rows)
+	{
+		meta->total_rows = new_total_rows;
+		any_changes = true;
+	}
+
+	if (any_changes)
+		columnar_write_metadata(locator, meta);
+
+	if (meta->stripes)
+		pfree(meta->stripes);
+	pfree(meta);
 }
 
 /* ----------------------------------------------------------------
