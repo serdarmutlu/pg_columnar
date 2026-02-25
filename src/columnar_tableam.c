@@ -31,6 +31,25 @@
 #include "columnar_write_buffer.h"
 #include "columnar_typemap.h"
 
+/* Level 4 custom scan node: planner hook + stripe pruning */
+#include "catalog/pg_am_d.h"		/* BTREE_AM_OID = 403 */
+#include "commands/defrem.h"		/* GetDefaultOpClass(type_oid, am_oid) */
+#include "commands/explain.h"		/* ExplainPropertyInteger */
+#include "nodes/extensible.h"		/* CustomPath/Scan/State, RegisterCustomScanMethods */
+#include "nodes/makefuncs.h"		/* makeNode */
+#include "nodes/parsenodes.h"		/* RangeTblEntry, RTE_RELATION */
+#include "optimizer/pathnode.h"		/* add_path() */
+#include "optimizer/paths.h"		/* set_rel_pathlist_hook_type */
+#include "utils/lsyscache.h"		/* get_op_opfamily_strategy, get_opcode,
+									 * get_opclass_family, get_commutator */
+#include "catalog/pg_am.h"		/* Form_pg_am */
+#include "catalog/pg_class.h"	/* Form_pg_class */
+#include "nodes/nodeFuncs.h"	/* exprCollation */
+#include "utils/syscache.h"		/* SearchSysCache1, ReleaseSysCache, AMNAME, RELOID */
+
+/* Forward declaration for non-static function defined later in this file */
+void columnar_custom_scan_init(void);
+
 /* ----------------------------------------------------------------
  * Scan descriptor for columnar tables.
  * ----------------------------------------------------------------
@@ -67,6 +86,9 @@ typedef struct ColumnarScanDescData
 	 * Allocated in CurrentMemoryContext; freed in columnar_close_stripe.
 	 */
 	uint8_t    *current_delete_bitmap;
+
+	/* Count of stripes skipped by min/max pruning (Level 4 custom scan) */
+	int64_t		stripes_skipped;
 } ColumnarScanDescData;
 
 typedef ColumnarScanDescData *ColumnarScanDesc;
@@ -104,6 +126,52 @@ typedef struct ColumnarIndexFetchData
 	 */
 	uint8_t    *cached_delete_bitmap;
 } ColumnarIndexFetchData;
+
+/* ----------------------------------------------------------------
+ * Level 4 Custom Scan: stripe-pruning scan provider
+ * ---------------------------------------------------------------- */
+
+typedef struct ColumnarCustomScanState
+{
+	CustomScanState css;			/* MUST be first */
+	ScanKeyData    *scan_keys;		/* rebuilt from custom_exprs at BeginCustomScan */
+	int				num_scan_keys;
+} ColumnarCustomScanState;
+
+/* Forward declarations */
+static Plan *columnar_plan_custom_path(PlannerInfo *, RelOptInfo *,
+									   struct CustomPath *, List *, List *, List *);
+static Node *columnar_create_custom_scan_state(CustomScan *);
+static void  columnar_begin_custom_scan(CustomScanState *, EState *, int);
+static TupleTableSlot *columnar_exec_custom_scan(CustomScanState *);
+static void  columnar_end_custom_scan(CustomScanState *);
+static void  columnar_rescan_custom_scan(CustomScanState *);
+static void  columnar_explain_custom_scan(CustomScanState *, List *, ExplainState *);
+static TupleTableSlot *columnar_custom_scan_fetch(ScanState *);
+static bool  columnar_custom_scan_recheck(ScanState *, TupleTableSlot *);
+static void  columnar_pathlist_hook(PlannerInfo *, RelOptInfo *, Index, RangeTblEntry *);
+
+static const CustomPathMethods columnar_custom_path_methods = {
+	.CustomName						  = "ColumnarScan",
+	.PlanCustomPath					  = columnar_plan_custom_path,
+	.ReparameterizeCustomPathByChild  = NULL,
+};
+
+static const CustomScanMethods columnar_custom_scan_methods = {
+	.CustomName				 = "ColumnarScan",
+	.CreateCustomScanState = columnar_create_custom_scan_state,
+};
+
+static const CustomExecMethods columnar_custom_exec_methods = {
+	.CustomName		  = "ColumnarScan",
+	.BeginCustomScan  = columnar_begin_custom_scan,
+	.ExecCustomScan	  = columnar_exec_custom_scan,
+	.EndCustomScan	  = columnar_end_custom_scan,
+	.ReScanCustomScan = columnar_rescan_custom_scan,
+	.ExplainCustomScan = columnar_explain_custom_scan,
+};
+
+static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
 
 /* ----------------------------------------------------------------
  * Helper: open a stripe's IPC stream into caller-supplied state.
@@ -732,6 +800,7 @@ columnar_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
 											sscan->rs_nkeys,
 											tupdesc))
 			{
+				scan->stripes_skipped++;
 				scan->current_stripe++;
 				continue;
 			}
@@ -2010,6 +2079,398 @@ columnar_scan_sample_next_tuple(TableScanDesc scan,
 								TupleTableSlot *slot)
 {
 	return false;
+}
+
+/* ================================================================
+ * Level 4 Custom Scan implementation
+ * ================================================================ */
+
+/*
+ * columnar_pathlist_hook — fired by the planner after standard paths are built.
+ * Extracts simple col op const quals, builds a CustomPath that passes them as
+ * explicit ScanKeyData to columnar_scan_begin, enabling stripe pruning.
+ */
+static void
+columnar_pathlist_hook(PlannerInfo *root, RelOptInfo *rel,
+					   Index rti, RangeTblEntry *rte)
+{
+	static Oid	cached_amoid = InvalidOid;
+	Oid			columnar_amoid;
+	HeapTuple	classtup;
+	bool		is_columnar;
+	ListCell   *lc;
+	List	   *matching_clauses = NIL;
+	List	   *matching_exprs = NIL;
+	CustomPath *cpath;
+
+	if (prev_set_rel_pathlist_hook)
+		prev_set_rel_pathlist_hook(root, rel, rti, rte);
+
+	if (rte->rtekind != RTE_RELATION || rel->baserestrictinfo == NIL ||
+		rel->pathlist == NIL)
+		return;
+
+	/* Lazy AM OID lookup */
+	if (!OidIsValid(cached_amoid))
+	{
+		HeapTuple	amtup = SearchSysCache1(AMNAME, CStringGetDatum("columnar"));
+
+		if (HeapTupleIsValid(amtup))
+		{
+			cached_amoid = ((Form_pg_am) GETSTRUCT(amtup))->oid;
+			ReleaseSysCache(amtup);
+		}
+	}
+	columnar_amoid = cached_amoid;
+	if (!OidIsValid(columnar_amoid))
+		return;
+
+	classtup = SearchSysCache1(RELOID, ObjectIdGetDatum(rte->relid));
+	if (!HeapTupleIsValid(classtup))
+		return;
+	is_columnar = (((Form_pg_class) GETSTRUCT(classtup))->relam == columnar_amoid);
+	ReleaseSysCache(classtup);
+	if (!is_columnar)
+		return;
+
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		OpExpr	   *opexpr;
+		Var		   *var;
+		Const	   *con;
+		bool		commuted;
+		Node	   *left,
+				   *right;
+		Oid			opno,
+					type_oid,
+					opclass,
+					opfamily;
+		int			strategy;
+
+		if (!IsA(rinfo->clause, OpExpr))
+			continue;
+		opexpr = (OpExpr *) rinfo->clause;
+		if (list_length(opexpr->args) != 2)
+			continue;
+
+		left = linitial(opexpr->args);
+		right = lsecond(opexpr->args);
+
+		if (IsA(left, Var) && IsA(right, Const))
+		{
+			var = (Var *) left;
+			con = (Const *) right;
+			commuted = false;
+		}
+		else if (IsA(right, Var) && IsA(left, Const))
+		{
+			var = (Var *) right;
+			con = (Const *) left;
+			commuted = true;
+		}
+		else
+			continue;
+
+		if ((Index) var->varno != rti || var->varlevelsup != 0 ||
+			var->varattno < 1 || con->constisnull)
+			continue;
+
+		opno = opexpr->opno;
+		type_oid = var->vartype;
+		opclass = GetDefaultOpClass(type_oid, BTREE_AM_OID);
+		if (!OidIsValid(opclass))
+			continue;
+		opfamily = get_opclass_family(opclass);
+		if (!OidIsValid(opfamily))
+			continue;
+
+		if (commuted)
+		{
+			Oid			comm_opno = get_commutator(opno);
+
+			if (!OidIsValid(comm_opno))
+				continue;
+			strategy = get_op_opfamily_strategy(comm_opno, opfamily);
+			if (strategy == 0)
+				continue;
+
+			/* Rebuild canonical (Var comm_opno Const) */
+			{
+				OpExpr	   *c = makeNode(OpExpr);
+
+				c->opno = comm_opno;
+				c->opfuncid = get_opcode(comm_opno);
+				c->opresulttype = BOOLOID;
+				c->opretset = false;
+				c->opcollid = InvalidOid;
+				c->inputcollid = exprCollation((Node *) var);
+				c->args = list_make2(copyObject(var), copyObject(con));
+				c->location = opexpr->location;
+				opexpr = c;
+			}
+		}
+		else
+		{
+			strategy = get_op_opfamily_strategy(opno, opfamily);
+			if (strategy == 0)
+				continue;
+		}
+
+		matching_clauses = lappend(matching_clauses, rinfo);
+		matching_exprs = lappend(matching_exprs, opexpr);
+	}
+
+	if (matching_exprs == NIL)
+		return;
+
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = rel;
+	cpath->path.pathtarget = rel->reltarget;
+	cpath->path.param_info = NULL;
+	cpath->path.parallel_aware = false;
+	cpath->path.parallel_safe = false;
+	cpath->path.parallel_workers = 0;
+	/*
+	 * set_rel_pathlist_hook fires before set_cheapest(), so
+	 * cheapest_total_path is still NULL.  Find the minimum-cost path in
+	 * rel->pathlist manually.
+	 */
+	{
+		Path	   *cheapest = linitial(rel->pathlist);
+		ListCell   *lc2;
+
+		foreach(lc2, rel->pathlist)
+		{
+			Path *p = (Path *) lfirst(lc2);
+			if (p->total_cost < cheapest->total_cost)
+				cheapest = p;
+		}
+		cpath->path.rows = cheapest->rows;
+		cpath->path.startup_cost = cheapest->startup_cost;
+		/*
+		 * Stripe pruning does at most the same work as a seq scan, so our
+		 * cost is at most equal to the seq scan cost.  A 1-unit reduction
+		 * ensures the planner prefers us over a plain seq scan on ties.
+		 */
+
+		/*
+		 * Estimate cost as seq_scan_cost * selectivity.  If the planner
+		 * estimates that the WHERE clause is selective, our stripe-pruning
+		 * scan will be proportionally cheaper (assuming roughly uniform
+		 * distribution of column values across stripes).  Use at least 1%
+		 * of seq_scan cost so add_path always accepts us when there are
+		 * prunable quals.
+		 */
+		{
+			double		selectivity;
+
+			if (rel->tuples > 0)
+				selectivity = (double) rel->rows / rel->tuples;
+			else
+				selectivity = 0.5;	/* fallback if stats unavailable */
+			selectivity = Max(selectivity, 0.01);	/* floor at 1% */
+			selectivity = Min(selectivity, 0.99);	/* always cheaper than seq scan */
+			cpath->path.total_cost = cheapest->total_cost * selectivity;
+		}
+	}
+	cpath->path.pathkeys = NIL;
+	cpath->flags = 0;
+	cpath->custom_paths = NIL;
+	/*
+	 * Do NOT set custom_restrictinfo.  We only do stripe-level pruning;
+	 * row-level filtering is done by the executor's outer Filter node.
+	 * If we claimed to handle the quals here, the planner would remove
+	 * the outer Filter and all rows would incorrectly pass through.
+	 */
+	cpath->custom_restrictinfo = NIL;
+	cpath->custom_private = matching_exprs;
+	cpath->methods = &columnar_custom_path_methods;
+
+	add_path(rel, (Path *) cpath);
+}
+
+static Plan *
+columnar_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
+						  struct CustomPath *best_path,
+						  List *tlist, List *clauses, List *custom_plans)
+{
+	CustomScan *cscan = makeNode(CustomScan);
+	List	   *qual = NIL;
+	ListCell   *lc2;
+
+	/*
+	 * Build scan.plan.qual from the clauses list so that the executor
+	 * applies row-level filtering.  Our stripe pruning reduces the number
+	 * of stripes scanned, but does NOT filter individual rows.
+	 */
+	foreach(lc2, clauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc2);
+
+		qual = lappend(qual, rinfo->clause);
+	}
+
+	cscan->scan.plan.targetlist = tlist;
+	cscan->scan.plan.qual = qual;
+	cscan->scan.scanrelid = rel->relid;
+	cscan->flags = best_path->flags;
+	cscan->custom_plans = NIL;
+	cscan->custom_relids = NULL;
+	cscan->methods = &columnar_custom_scan_methods;
+
+	/*
+	 * custom_exprs: the matching OpExprs stored in best_path->custom_private.
+	 * ExecInitCustomScan converts these to ss.ps.qual for row-level filtering.
+	 * BeginCustomScan re-parses them to build ScanKeyData[] for stripe pruning.
+	 */
+	cscan->custom_exprs = (List *) copyObject(best_path->custom_private);
+	cscan->custom_private = NIL;
+
+	return (Plan *) cscan;
+}
+
+static Node *
+columnar_create_custom_scan_state(CustomScan *cscan)
+{
+	ColumnarCustomScanState *state =
+		(ColumnarCustomScanState *) palloc0(sizeof(ColumnarCustomScanState));
+
+	state->css.methods = &columnar_custom_exec_methods;
+	state->css.ss.ps.type = T_CustomScanState;
+	state->css.slotOps = &TTSOpsVirtual;
+	return (Node *) state;
+}
+
+static void
+columnar_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
+{
+	ColumnarCustomScanState *cstate = (ColumnarCustomScanState *) node;
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	List	   *exprs = cscan->custom_exprs;
+	ScanKeyData *keys = palloc0(list_length(exprs) * sizeof(ScanKeyData));
+	int			nkeys = 0;
+	ListCell   *lc;
+
+	foreach(lc, exprs)
+	{
+		OpExpr	   *opexpr = lfirst_node(OpExpr, lc);
+		Var		   *var = linitial_node(Var, opexpr->args);
+		Const	   *con = lsecond_node(Const, opexpr->args);
+		Oid			opclass;
+		Oid			opfamily;
+		int			strategy;
+		RegProcedure opfunc;
+
+		opclass = GetDefaultOpClass(var->vartype, BTREE_AM_OID);
+		if (!OidIsValid(opclass))
+			continue;
+		opfamily = get_opclass_family(opclass);
+		if (!OidIsValid(opfamily))
+			continue;
+		strategy = get_op_opfamily_strategy(opexpr->opno, opfamily);
+		if (strategy == 0)
+			continue;
+		opfunc = get_opcode(opexpr->opno);
+		if (!RegProcedureIsValid(opfunc))
+			continue;
+
+		ScanKeyInit(&keys[nkeys],
+					(AttrNumber) var->varattno,
+					(StrategyNumber) strategy,
+					opfunc,
+					con->constvalue);
+		nkeys++;
+	}
+
+	cstate->scan_keys = keys;
+	cstate->num_scan_keys = nkeys;
+
+	node->ss.ss_currentScanDesc =
+		table_beginscan(node->ss.ss_currentRelation,
+						estate->es_snapshot,
+						nkeys, nkeys > 0 ? keys : NULL);
+}
+
+/* ExecScanAccessMtd: TupleTableSlot *(*)(ScanState *) — one argument */
+static TupleTableSlot *
+columnar_custom_scan_fetch(ScanState *ss)
+{
+	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
+
+	if (!table_scan_getnextslot(ss->ss_currentScanDesc,
+								ForwardScanDirection, slot))
+		return NULL;
+	return slot;
+}
+
+/* ExecScanRecheckMtd: bool (*)(ScanState *, TupleTableSlot *) — two arguments */
+static bool
+columnar_custom_scan_recheck(ScanState *ss, TupleTableSlot *slot)
+{
+	/* no lossy pages; fetched rows are always valid */
+	return true;
+}
+
+static TupleTableSlot *
+columnar_exec_custom_scan(CustomScanState *node)
+{
+	return ExecScan(&node->ss,
+					(ExecScanAccessMtd) columnar_custom_scan_fetch,
+					(ExecScanRecheckMtd) columnar_custom_scan_recheck);
+}
+
+static void
+columnar_end_custom_scan(CustomScanState *node)
+{
+	if (node->ss.ss_currentScanDesc)
+	{
+		table_endscan(node->ss.ss_currentScanDesc);
+		node->ss.ss_currentScanDesc = NULL;
+	}
+	/* ExecEndCustomScan closes ss_currentRelation — do NOT close it here */
+}
+
+static void
+columnar_rescan_custom_scan(CustomScanState *node)
+{
+	ColumnarCustomScanState *cstate = (ColumnarCustomScanState *) node;
+
+	if (node->ss.ss_currentScanDesc)
+		table_rescan(node->ss.ss_currentScanDesc,
+					 cstate->num_scan_keys > 0 ? cstate->scan_keys : NULL);
+	ExecScanReScan(&node->ss);
+}
+
+static void
+columnar_explain_custom_scan(CustomScanState *node,
+							 List *ancestors, ExplainState *es)
+{
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	ColumnarScanDesc tscan = (ColumnarScanDesc) node->ss.ss_currentScanDesc;
+
+	ExplainPropertyInteger("Columnar pruning quals", NULL,
+						   list_length(cscan->custom_exprs), es);
+	if (tscan)
+	{
+		ExplainPropertyInteger("Stripes total", NULL,
+							   (int64) tscan->num_stripes, es);
+		ExplainPropertyInteger("Stripes skipped", NULL,
+							   (int64) tscan->stripes_skipped, es);
+	}
+}
+
+/*
+ * columnar_custom_scan_init — called from _PG_init to register the custom
+ * scan methods and install the planner hook.
+ */
+void
+columnar_custom_scan_init(void)
+{
+	RegisterCustomScanMethods(&columnar_custom_scan_methods);
+	prev_set_rel_pathlist_hook = set_rel_pathlist_hook;
+	set_rel_pathlist_hook = columnar_pathlist_hook;
 }
 
 /* ----------------------------------------------------------------

@@ -17,6 +17,7 @@
 PG_MODULE_MAGIC;
 
 extern const TableAmRoutine columnar_am_methods;
+extern void columnar_custom_scan_init(void);
 
 void		_PG_init(void);
 
@@ -67,6 +68,9 @@ _PG_init(void)
 
 	prev_object_access_hook = object_access_hook;
 	object_access_hook = columnar_object_access_hook;
+
+	/* Level 4: register custom scan provider for stripe pruning */
+	columnar_custom_scan_init();
 }
 
 /*
