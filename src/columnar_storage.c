@@ -604,6 +604,273 @@ columnar_bitmap_cache_evict_relation(const RelFileLocator *locator)
 	pfree(keys);
 }
 
+/* ----------------------------------------------------------------
+ * Backend-local per-stripe IPC bytes cache (Level 4b)
+ *
+ * Caches the decompressed Arrow IPC stream bytes for each stripe so
+ * that repeat accesses within the same backend session avoid disk I/O
+ * and (for compressed stripes) decompression entirely.
+ *
+ * Key:   (dbOid, relNumber, stripe_id) — same three-field key as
+ *        the stats and bitmap caches.
+ * Value: palloc'd copy of the decompressed IPC bytes in
+ *        stripe_ipc_cache_ctx.
+ * Capacity: bounded by columnar.stripe_cache_size_mb (default 256 MB).
+ *           When a new entry would exceed the limit, the LRU entry is
+ *           evicted first.
+ *
+ * Stripes are write-once: once flushed, a stripe file is never modified.
+ * Therefore no per-stripe invalidation on write is needed; only on
+ * DROP TABLE / TRUNCATE (which evicts the whole relation).
+ *
+ * LRU tracking: each entry carries a lru_clock counter that is
+ * incremented on every cache hit.  Eviction performs a linear scan to
+ * find the entry with the smallest clock value.  This is acceptable
+ * because (a) the cache is bounded in size, so the number of entries is
+ * moderate, and (b) the eviction path is rare relative to the hit path.
+ * ----------------------------------------------------------------
+ */
+
+typedef struct ColumnarIpcCacheKey
+{
+	Oid			dbOid;
+	Oid			relNumber;
+	int			stripe_id;
+	/* 3 × 4 = 12 bytes, naturally aligned; no padding */
+} ColumnarIpcCacheKey;
+
+typedef struct ColumnarIpcCacheEntry
+{
+	ColumnarIpcCacheKey key;		/* MUST be first for HTAB */
+	uint8_t    *ipc_bytes;			/* palloc'd in stripe_ipc_cache_ctx */
+	size_t		ipc_size;
+	uint64		lru_clock;			/* incremented on every hit */
+} ColumnarIpcCacheEntry;
+
+static HTAB *stripe_ipc_cache = NULL;
+static MemoryContext stripe_ipc_cache_ctx = NULL;
+static uint64 stripe_ipc_lru_clock = 0;
+static size_t stripe_ipc_total_bytes = 0;
+
+/*
+ * Initialise the IPC bytes cache.  Called lazily on first use.
+ */
+static void
+columnar_stripe_ipc_cache_init(void)
+{
+	HASHCTL		ctl;
+
+	stripe_ipc_cache_ctx = AllocSetContextCreate(TopMemoryContext,
+												  "columnar stripe ipc cache",
+												  ALLOCSET_DEFAULT_SIZES);
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(ColumnarIpcCacheKey);
+	ctl.entrysize = sizeof(ColumnarIpcCacheEntry);
+	ctl.hcxt = stripe_ipc_cache_ctx;
+
+	stripe_ipc_cache = hash_create("columnar stripe ipc cache",
+								   256,	/* initial buckets; grows automatically */
+								   &ctl,
+								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+/*
+ * Evict the single LRU entry from the IPC bytes cache.
+ * No-op if the cache is empty.
+ */
+static void
+columnar_stripe_ipc_cache_evict_one_lru(void)
+{
+	HASH_SEQ_STATUS seq;
+	ColumnarIpcCacheEntry *entry;
+	ColumnarIpcCacheKey lru_key;
+	uint64		min_clock = PG_UINT64_MAX;
+	bool		found_any = false;
+	bool		found;
+
+	if (stripe_ipc_cache == NULL)
+		return;
+
+	hash_seq_init(&seq, stripe_ipc_cache);
+	while ((entry = (ColumnarIpcCacheEntry *) hash_seq_search(&seq)) != NULL)
+	{
+		if (entry->lru_clock < min_clock)
+		{
+			min_clock = entry->lru_clock;
+			lru_key = entry->key;
+			found_any = true;
+		}
+	}
+	/* seq scan ran to completion — no need for hash_seq_term */
+
+	if (!found_any)
+		return;
+
+	entry = hash_search(stripe_ipc_cache, &lru_key, HASH_FIND, &found);
+	if (found && entry->ipc_bytes != NULL)
+	{
+		stripe_ipc_total_bytes -= entry->ipc_size;
+		pfree(entry->ipc_bytes);
+		entry->ipc_bytes = NULL;
+	}
+	hash_search(stripe_ipc_cache, &lru_key, HASH_REMOVE, NULL);
+}
+
+/*
+ * Look up a stripe's IPC bytes in the cache.
+ *
+ * Returns NULL on a cache miss.  On a hit, returns a palloc'd copy of
+ * the cached bytes in CurrentMemoryContext and sets *out_size.
+ * The caller owns the returned allocation and should pfree it when done.
+ *
+ * Updates the LRU clock for the hit entry.
+ */
+uint8_t *
+columnar_stripe_ipc_cache_lookup(const RelFileLocator *locator,
+								  int stripe_id,
+								  size_t *out_size)
+{
+	ColumnarIpcCacheKey key;
+	ColumnarIpcCacheEntry *entry;
+	bool		found;
+	uint8_t    *copy;
+
+	if (stripe_ipc_cache == NULL)
+		return NULL;
+
+	memset(&key, 0, sizeof(key));
+	key.dbOid = (Oid) PG_LOCATOR_DB(locator);
+	key.relNumber = (Oid) PG_LOCATOR_REL(locator);
+	key.stripe_id = stripe_id;
+
+	entry = hash_search(stripe_ipc_cache, &key, HASH_FIND, &found);
+	if (!found || entry->ipc_bytes == NULL)
+		return NULL;
+
+	entry->lru_clock = ++stripe_ipc_lru_clock;
+	*out_size = entry->ipc_size;
+
+	/* Return a palloc'd copy in CurrentMemoryContext */
+	copy = palloc(entry->ipc_size);
+	memcpy(copy, entry->ipc_bytes, entry->ipc_size);
+	return copy;
+}
+
+/*
+ * Insert (or replace) a stripe's IPC bytes in the cache.
+ *
+ * Copies size bytes from bytes into the cache context.  Evicts the LRU
+ * entry if adding the new entry would exceed the configured limit.
+ * No-op if columnar.stripe_cache_size_mb == 0 (caching disabled) or if
+ * size exceeds the entire configured limit.
+ */
+void
+columnar_stripe_ipc_cache_insert(const RelFileLocator *locator,
+								  int stripe_id,
+								  const uint8_t *bytes,
+								  size_t size)
+{
+	size_t		limit_bytes;
+	ColumnarIpcCacheKey key;
+	ColumnarIpcCacheEntry *entry;
+	bool		found;
+	MemoryContext oldcxt;
+
+	/* columnar_stripe_cache_size_mb is defined in pg_columnar.c */
+	limit_bytes = (size_t) columnar_stripe_cache_size_mb * 1024 * 1024;
+
+	if (limit_bytes == 0 || size > limit_bytes)
+		return;					/* caching disabled or stripe too large */
+
+	if (stripe_ipc_cache == NULL)
+		columnar_stripe_ipc_cache_init();
+
+	/* Evict LRU entries until there is room for the new entry */
+	while (stripe_ipc_total_bytes + size > limit_bytes &&
+		   hash_get_num_entries(stripe_ipc_cache) > 0)
+		columnar_stripe_ipc_cache_evict_one_lru();
+
+	memset(&key, 0, sizeof(key));
+	key.dbOid = (Oid) PG_LOCATOR_DB(locator);
+	key.relNumber = (Oid) PG_LOCATOR_REL(locator);
+	key.stripe_id = stripe_id;
+
+	entry = hash_search(stripe_ipc_cache, &key, HASH_ENTER, &found);
+
+	/* Free the old bytes if overwriting an existing entry */
+	if (found && entry->ipc_bytes != NULL)
+	{
+		stripe_ipc_total_bytes -= entry->ipc_size;
+		pfree(entry->ipc_bytes);
+		entry->ipc_bytes = NULL;
+	}
+
+	oldcxt = MemoryContextSwitchTo(stripe_ipc_cache_ctx);
+	entry->ipc_bytes = palloc(size);
+	MemoryContextSwitchTo(oldcxt);
+
+	memcpy(entry->ipc_bytes, bytes, size);
+	entry->ipc_size = size;
+	entry->lru_clock = ++stripe_ipc_lru_clock;
+	stripe_ipc_total_bytes += size;
+}
+
+/*
+ * Evict all IPC bytes cache entries for a relation.
+ *
+ * Called from columnar_remove_storage() on DROP TABLE / TRUNCATE.
+ * Uses collect-then-delete to avoid modifying the HTAB during iteration.
+ */
+void
+columnar_stripe_ipc_cache_evict_relation(const RelFileLocator *locator)
+{
+	Oid			target_db = (Oid) PG_LOCATOR_DB(locator);
+	Oid			target_rel = (Oid) PG_LOCATOR_REL(locator);
+	HASH_SEQ_STATUS seq;
+	ColumnarIpcCacheEntry *entry;
+	ColumnarIpcCacheKey *keys;
+	int			nkeys = 0;
+	int			maxkeys = 64;
+	int			i;
+
+	if (stripe_ipc_cache == NULL)
+		return;
+
+	keys = palloc(sizeof(ColumnarIpcCacheKey) * maxkeys);
+
+	hash_seq_init(&seq, stripe_ipc_cache);
+	while ((entry = (ColumnarIpcCacheEntry *) hash_seq_search(&seq)) != NULL)
+	{
+		if (entry->key.dbOid != target_db || entry->key.relNumber != target_rel)
+			continue;
+
+		if (nkeys >= maxkeys)
+		{
+			maxkeys *= 2;
+			keys = repalloc(keys, sizeof(ColumnarIpcCacheKey) * maxkeys);
+		}
+		keys[nkeys++] = entry->key;
+	}
+	/* seq scan ran to completion — no need for hash_seq_term */
+
+	for (i = 0; i < nkeys; i++)
+	{
+		bool		found;
+
+		entry = hash_search(stripe_ipc_cache, &keys[i], HASH_FIND, &found);
+		if (found && entry->ipc_bytes != NULL)
+		{
+			stripe_ipc_total_bytes -= entry->ipc_size;
+			pfree(entry->ipc_bytes);
+			entry->ipc_bytes = NULL;
+		}
+		hash_search(stripe_ipc_cache, &keys[i], HASH_REMOVE, NULL);
+	}
+
+	pfree(keys);
+}
+
 char *
 columnar_dir_path(const RelFileLocator *locator)
 {
@@ -702,6 +969,7 @@ columnar_remove_storage(const RelFileLocator *locator)
 	columnar_metadata_cache_evict(locator);
 	columnar_stats_cache_evict_relation(locator);
 	columnar_bitmap_cache_evict_relation(locator);
+	columnar_stripe_ipc_cache_evict_relation(locator);
 
 	dir = opendir(dirpath);
 	if (dir == NULL)

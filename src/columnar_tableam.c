@@ -180,6 +180,29 @@ static set_rel_pathlist_hook_type prev_set_rel_pathlist_hook = NULL;
  * The caller owns both and must release them when done.
  * ----------------------------------------------------------------
  */
+/*
+ * Finish initialising the IPC reader from an already-prepared input_stream.
+ * Common tail shared by the cache-hit path and the cache-miss paths.
+ */
+static void
+columnar_finish_stream_init(struct ArrowIpcInputStream *input_stream,
+							struct ArrowArrayStream *out_stream,
+							struct ArrowSchema *out_schema,
+							int stripe_id)
+{
+	int			rc;
+
+	rc = ArrowIpcArrayStreamReaderInit(out_stream, input_stream, NULL);
+	if (rc != NANOARROW_OK)
+		ereport(ERROR, (errmsg("columnar: failed to init IPC reader for stripe %d",
+							   stripe_id)));
+
+	rc = out_stream->get_schema(out_stream, out_schema);
+	if (rc != 0)
+		ereport(ERROR, (errmsg("columnar: failed to read schema from stripe %d",
+							   stripe_id)));
+}
+
 static void
 columnar_open_stripe_stream(const RelFileLocator *locator,
 							StripeMetadata *sm,
@@ -189,46 +212,154 @@ columnar_open_stripe_stream(const RelFileLocator *locator,
 	char	   *filepath;
 	FILE	   *fp;
 	struct ArrowIpcInputStream input_stream;
-	int			rc;
 
 	filepath = columnar_stripe_path(locator, sm->stripe_id);
 
+	/* ----------------------------------------------------------------
+	 * Level 4b: check the per-backend IPC bytes cache first.
+	 *
+	 * On a cache hit we copy the cached bytes into a nanoarrow-owned
+	 * ArrowBuffer (ArrowBufferReserve uses malloc internally) and init
+	 * the stream from it.  This avoids disk I/O and, for compressed
+	 * stripes, the decompression pass entirely.
+	 * ----------------------------------------------------------------
+	 */
+	{
+		size_t		cached_size = 0;
+		uint8_t    *cached_copy;
+
+		cached_copy = columnar_stripe_ipc_cache_lookup(locator,
+													   sm->stripe_id,
+													   &cached_size);
+		if (cached_copy != NULL)
+		{
+			/*
+			 * Transfer bytes into a nanoarrow-managed ArrowBuffer so
+			 * ArrowIpcInputStreamInitBuffer can take ownership safely.
+			 * ArrowBufferReserve allocates via nanoarrow's internal malloc
+			 * allocator; the buffer will be freed by nanoarrow when the
+			 * stream is released — no memory leak.
+			 */
+			struct ArrowBuffer nanoarrow_buf;
+			int			rc;
+
+			ArrowBufferInit(&nanoarrow_buf);
+			if (ArrowBufferReserve(&nanoarrow_buf, (int64_t) cached_size)
+				!= NANOARROW_OK)
+			{
+				pfree(cached_copy);
+				pfree(filepath);
+				ereport(ERROR, (errmsg("columnar: ArrowBufferReserve failed "
+									   "(stripe %d cache hit)", sm->stripe_id)));
+			}
+			memcpy(nanoarrow_buf.data, cached_copy, cached_size);
+			nanoarrow_buf.size_bytes = (int64_t) cached_size;
+			pfree(cached_copy);		/* free our palloc'd lookup copy */
+
+			rc = ArrowIpcInputStreamInitBuffer(&input_stream, &nanoarrow_buf);
+			pfree(filepath);
+			if (rc != NANOARROW_OK)
+			{
+				ArrowBufferReset(&nanoarrow_buf);
+				ereport(ERROR, (errmsg("columnar: failed to init IPC buffer "
+									   "input stream from cache (stripe %d)",
+									   sm->stripe_id)));
+			}
+
+			columnar_finish_stream_init(&input_stream, out_stream, out_schema,
+										sm->stripe_id);
+			return;
+		}
+	}
+
+	/* ----------------------------------------------------------------
+	 * Cache miss: read from disk and populate the cache.
+	 * ----------------------------------------------------------------
+	 */
+
 	if (sm->compression == COLUMNAR_COMPRESSION_NONE)
 	{
-		/* Uncompressed: read directly from file */
+		/*
+		 * Uncompressed: read entire file into a nanoarrow ArrowBuffer so we
+		 * can (a) cache the bytes and (b) use ArrowIpcInputStreamInitBuffer
+		 * uniformly.  Previously we used ArrowIpcInputStreamInitFile for lazy
+		 * reading, but that prevents caching without reading all bytes anyway.
+		 */
+		struct ArrowBuffer raw;
+		int			rc;
+
 		fp = fopen(filepath, "rb");
 		if (fp == NULL)
+		{
+			pfree(filepath);
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not open stripe file \"%s\": %m", filepath)));
+					 errmsg("could not open stripe file: %m")));
+		}
 
-		rc = ArrowIpcInputStreamInitFile(&input_stream, fp, 1);
-		if (rc != NANOARROW_OK)
+		ArrowBufferInit(&raw);
+		if (ArrowBufferReserve(&raw, sm->file_size) != NANOARROW_OK)
 		{
 			fclose(fp);
-			ereport(ERROR, (errmsg("columnar: failed to init IPC input stream")));
+			pfree(filepath);
+			ereport(ERROR, (errmsg("columnar: ArrowBufferReserve failed "
+								   "(stripe %d, %lld bytes)",
+								   sm->stripe_id, (long long) sm->file_size)));
+		}
+
+		if (fread(raw.data, 1, sm->file_size, fp) != (size_t) sm->file_size)
+		{
+			fclose(fp);
+			ArrowBufferReset(&raw);
+			pfree(filepath);
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read stripe file: %m")));
+		}
+		fclose(fp);
+		raw.size_bytes = sm->file_size;
+
+		/* Cache the raw IPC bytes before ArrowIpcInputStreamInitBuffer takes
+		 * ownership of the ArrowBuffer (the buffer's data pointer may move
+		 * during realloc inside nanoarrow; cache from raw.data now). */
+		columnar_stripe_ipc_cache_insert(locator, sm->stripe_id,
+										 (const uint8_t *) raw.data,
+										 (size_t) sm->file_size);
+
+		rc = ArrowIpcInputStreamInitBuffer(&input_stream, &raw);
+		pfree(filepath);
+		if (rc != NANOARROW_OK)
+		{
+			ArrowBufferReset(&raw);
+			ereport(ERROR, (errmsg("columnar: failed to init IPC buffer "
+								   "input stream (stripe %d)", sm->stripe_id)));
 		}
 	}
 	else
 	{
-		/* Compressed: read file, decompress, use buffer input stream */
+		/* Compressed: read file, decompress, cache, use buffer input stream */
 		void	   *file_data;
 		struct ArrowBuffer decompressed;
+		int			rc;
 
 		fp = fopen(filepath, "rb");
 		if (fp == NULL)
+		{
+			pfree(filepath);
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not open stripe file \"%s\": %m", filepath)));
+					 errmsg("could not open stripe file: %m")));
+		}
 
 		file_data = palloc(sm->file_size);
 		if (fread(file_data, 1, sm->file_size, fp) != (size_t) sm->file_size)
 		{
 			fclose(fp);
 			pfree(file_data);
+			pfree(filepath);
 			ereport(ERROR,
 					(errcode_for_file_access(),
-					 errmsg("could not read stripe file \"%s\": %m", filepath)));
+					 errmsg("could not read stripe file: %m")));
 		}
 		fclose(fp);
 
@@ -247,6 +378,7 @@ columnar_open_stripe_stream(const RelFileLocator *locator,
 			{
 				pfree(file_data);
 				ArrowBufferReset(&decompressed);
+				pfree(filepath);
 				ereport(ERROR,
 						(errmsg("columnar: ZSTD decompression failed: %s",
 								ZSTD_getErrorName(result))));
@@ -255,6 +387,7 @@ columnar_open_stripe_stream(const RelFileLocator *locator,
 #else
 			pfree(file_data);
 			ArrowBufferReset(&decompressed);
+			pfree(filepath);
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("columnar: ZSTD support not compiled in")));
@@ -274,6 +407,7 @@ columnar_open_stripe_stream(const RelFileLocator *locator,
 			{
 				pfree(file_data);
 				ArrowBufferReset(&decompressed);
+				pfree(filepath);
 				ereport(ERROR,
 						(errmsg("columnar: LZ4 decompression context failed")));
 			}
@@ -290,6 +424,7 @@ columnar_open_stripe_stream(const RelFileLocator *locator,
 			{
 				pfree(file_data);
 				ArrowBufferReset(&decompressed);
+				pfree(filepath);
 				ereport(ERROR,
 						(errmsg("columnar: LZ4 decompression failed: %s",
 								LZ4F_getErrorName(ret))));
@@ -298,6 +433,7 @@ columnar_open_stripe_stream(const RelFileLocator *locator,
 #else
 			pfree(file_data);
 			ArrowBufferReset(&decompressed);
+			pfree(filepath);
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("columnar: LZ4 support not compiled in")));
@@ -305,27 +441,26 @@ columnar_open_stripe_stream(const RelFileLocator *locator,
 		}
 
 		pfree(file_data);
+		pfree(filepath);
+
+		/* Cache the decompressed IPC bytes before ArrowIpcInputStreamInitBuffer
+		 * takes ownership of the ArrowBuffer. */
+		columnar_stripe_ipc_cache_insert(locator, sm->stripe_id,
+										 (const uint8_t *) decompressed.data,
+										 (size_t) decompressed.size_bytes);
 
 		/* ArrowIpcInputStreamInitBuffer takes ownership of decompressed */
 		rc = ArrowIpcInputStreamInitBuffer(&input_stream, &decompressed);
 		if (rc != NANOARROW_OK)
 		{
 			ArrowBufferReset(&decompressed);
-			ereport(ERROR, (errmsg("columnar: failed to init IPC buffer input stream")));
+			ereport(ERROR, (errmsg("columnar: failed to init IPC buffer "
+								   "input stream (stripe %d)", sm->stripe_id)));
 		}
 	}
 
-	rc = ArrowIpcArrayStreamReaderInit(out_stream, &input_stream, NULL);
-	if (rc != NANOARROW_OK)
-		ereport(ERROR, (errmsg("columnar: failed to init IPC reader")));
-
-	/* Read schema */
-	rc = out_stream->get_schema(out_stream, out_schema);
-	if (rc != 0)
-		ereport(ERROR, (errmsg("columnar: failed to read schema from stripe %d",
-							   sm->stripe_id)));
-
-	pfree(filepath);
+	columnar_finish_stream_init(&input_stream, out_stream, out_schema,
+								sm->stripe_id);
 }
 
 static void

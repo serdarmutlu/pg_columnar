@@ -34,6 +34,9 @@ static Oid	columnar_am_oid = InvalidOid;
 /* GUC: columnar.compression */
 int			columnar_compression = COLUMNAR_COMPRESSION_NONE;
 
+/* GUC: columnar.stripe_cache_size_mb */
+int			columnar_stripe_cache_size_mb = 256;
+
 static const struct config_enum_entry columnar_compression_options[] = {
 	{"none", COLUMNAR_COMPRESSION_NONE, false},
 	{"lz4", COLUMNAR_COMPRESSION_LZ4, false},
@@ -63,6 +66,19 @@ _PG_init(void)
 							 NULL,
 							 NULL,
 							 NULL);
+
+	DefineCustomIntVariable("columnar.stripe_cache_size_mb",
+							"Per-backend cache size for decompressed stripe IPC bytes (MB). 0 = disabled.",
+							NULL,
+							&columnar_stripe_cache_size_mb,
+							256,	/* default: 256 MB */
+							0,		/* min: 0 (disabled) */
+							16384,	/* max: 16 GB */
+							PGC_USERSET,
+							GUC_UNIT_MB,
+							NULL,
+							NULL,
+							NULL);
 
 	RegisterXactCallback(columnar_xact_callback, NULL);
 

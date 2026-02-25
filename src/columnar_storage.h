@@ -20,6 +20,9 @@ typedef enum ColumnarCompression
 /* GUC variable — current compression setting */
 extern int	columnar_compression;
 
+/* GUC variable — per-backend stripe IPC bytes cache size in MB (0 = disabled) */
+extern int	columnar_stripe_cache_size_mb;
+
 /*
  * Metadata for a single stripe.
  */
@@ -237,5 +240,52 @@ extern void columnar_stats_cache_evict_stripe(const RelFileLocator *locator,
  */
 extern void columnar_bitmap_cache_evict_stripe(const RelFileLocator *locator,
 											   int stripe_id);
+
+/* ----------------------------------------------------------------
+ * Per-backend stripe IPC bytes cache (Level 4b)
+ *
+ * Caches the decompressed Arrow IPC stream bytes for each stripe so that
+ * repeat accesses (second query on the same table in the same session)
+ * skip disk I/O and decompression entirely.
+ *
+ * Key:   (dbOid, relNumber, stripe_id)
+ * Value: decompressed IPC bytes (palloc'd in stripe_ipc_cache_ctx)
+ *
+ * Bounded by columnar.stripe_cache_size_mb (default 256 MB).
+ * LRU eviction when the limit is exceeded.
+ *
+ * Invalidation:
+ *   columnar_stripe_ipc_cache_evict_relation() — called from
+ *   columnar_remove_storage() on DROP TABLE / TRUNCATE.
+ *   (Stripes are write-once; no per-stripe eviction needed on writes.)
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * Look up a stripe's IPC bytes in the cache.
+ * Returns NULL on a miss.  On a hit, returns a palloc'd copy of the cached
+ * bytes in CurrentMemoryContext; *out_size is set to the byte count.
+ * The caller is responsible for the returned allocation.
+ */
+extern uint8_t *columnar_stripe_ipc_cache_lookup(const RelFileLocator *locator,
+												  int stripe_id,
+												  size_t *out_size);
+
+/*
+ * Insert or replace a stripe's IPC bytes in the cache.
+ * bytes must point to size contiguous bytes; they are copied into the cache.
+ * Evicts the LRU entry if the new entry would exceed the configured limit.
+ * No-op if columnar.stripe_cache_size_mb == 0.
+ */
+extern void columnar_stripe_ipc_cache_insert(const RelFileLocator *locator,
+											  int stripe_id,
+											  const uint8_t *bytes,
+											  size_t size);
+
+/*
+ * Evict all IPC cache entries for a relation.
+ * Called from columnar_remove_storage() on DROP TABLE / TRUNCATE.
+ */
+extern void columnar_stripe_ipc_cache_evict_relation(const RelFileLocator *locator);
 
 #endif /* COLUMNAR_STORAGE_H */
