@@ -110,6 +110,26 @@ Typical compression ratios (varies with data):
 
 **Note:** Compressed stripes are not readable by external Arrow tools (PyArrow, DuckDB, etc.) since the entire IPC stream is compressed as a single blob. Uncompressed stripes remain fully compatible.
 
+### Stripe IPC cache
+
+Decompressed stripe bytes are cached per-backend so that repeat scans on the same table
+within the same session skip disk I/O and decompression entirely:
+
+```sql
+-- Check current setting
+SHOW columnar.stripe_cache_size_mb;    -- default: 256
+
+-- Increase the per-backend cache (in MB)
+SET columnar.stripe_cache_size_mb = 512;
+
+-- Disable the cache
+SET columnar.stripe_cache_size_mb = 0;
+```
+
+The GUC controls the maximum number of megabytes of decompressed IPC bytes held in the
+backend's memory. When the limit is reached, the least-recently-used stripe is evicted.
+The cache is automatically cleared for a table on `DROP TABLE` and `TRUNCATE`.
+
 ### DELETE and UPDATE
 
 Standard SQL DELETE and UPDATE are fully supported:
@@ -244,29 +264,50 @@ Note: index-only scans are not supported — the access method always fetches th
 ### Stripe pruning
 
 Each stripe carries a companion `.stats` file with per-column min/max values for
-integer, date, timestamp, and float columns. When a scan includes explicit filter
-conditions (passed as `ScanKeyData`), stripes whose value ranges cannot possibly
-satisfy the filter are skipped entirely — no file is opened and no rows are read.
+integer, date, timestamp, and float columns. A custom scan node intercepts queries
+at plan time and extracts `col op constant` filter conditions from the `WHERE` clause.
+Stripes whose value ranges cannot possibly satisfy the filter are skipped entirely —
+no file is opened and no rows are read.
 
 For example, if a table has 100 stripes of 10,000 rows each and a filter matches
 only one stripe's range, 99 stripes are skipped with no I/O.
 
+`EXPLAIN ANALYZE` reports the number of stripes skipped:
+
+```sql
+EXPLAIN (ANALYZE, COSTS OFF)
+SELECT count(*) FROM measurements WHERE id < 50000;
+-- Custom Scan (ColumnarScan) on measurements
+--   Stripes skipped: 9 of 10
+```
+
 ### In-memory caches
 
-Three backend-local in-memory caches eliminate repeated file I/O within a session:
+Four backend-local in-memory caches eliminate repeated file I/O within a session:
 
 | Cache | Key | Eliminates |
 |---|---|---|
 | Metadata cache | `(dbOid, relNumber)` | One metadata file read per TID during index scans |
 | Stats cache | `(dbOid, relNumber, stripe_id)` | One `.stats` file read per stripe per scan |
 | Bitmap cache | `(dbOid, relNumber, stripe_id)` | One `.deleted` file read per stripe per scan + read half of DELETE read-modify-write |
+| IPC bytes cache | `(dbOid, relNumber, stripe_id)` | All disk I/O and decompression for repeat scans on the same stripes |
 
 All caches are backend-local (not shared across connections) and are automatically
 invalidated on `DROP TABLE`, `TRUNCATE`, and `VACUUM`.
 
-Both the stats cache and the bitmap cache store a **"file absent" marker** for stripes
-that have no companion file (pre-Level-3 stripes for stats; stripes with no deletions
-for bitmaps), so repeated scans do not retry failed `fopen` calls.
+The stats cache and bitmap cache store a **"file absent" marker** for stripes that have
+no companion file (pre-stats stripes; stripes with no deletions), so repeated scans do
+not retry failed `fopen` calls.
+
+The IPC bytes cache stores the decompressed Arrow IPC stream for each stripe (bounded
+by `columnar.stripe_cache_size_mb`). On a warm cache, a second scan of the same table
+replays the IPC bytes from memory rather than reopening stripe files:
+
+| Compression | Typical speedup (warm vs cold) |
+|---|---|
+| `none`   | ~4–5× |
+| `lz4`    | ~1.5–2× |
+| `zstd`   | ~2× |
 
 ## Current Limitations
 
