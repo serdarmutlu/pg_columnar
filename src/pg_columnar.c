@@ -1,5 +1,6 @@
 #include "postgres.h"
 
+#include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/objectaccess.h"
@@ -8,6 +9,7 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "utils/guc.h"
+#include "utils/rel.h"
 #include "utils/syscache.h"
 
 #include "pg_compat.h"
@@ -45,6 +47,7 @@ static const struct config_enum_entry columnar_compression_options[] = {
 };
 
 PG_FUNCTION_INFO_V1(columnar_handler);
+PG_FUNCTION_INFO_V1(columnar_relation_size_sql);
 
 Datum
 columnar_handler(PG_FUNCTION_ARGS)
@@ -92,7 +95,7 @@ _PG_init(void)
 /*
  * Look up the OID of the 'columnar' access method, caching the result.
  */
-static Oid
+Oid
 get_columnar_am_oid(void)
 {
 	if (columnar_am_oid == InvalidOid)
@@ -180,4 +183,44 @@ columnar_xact_callback(XactEvent event, void *arg)
 		default:
 			break;
 	}
+}
+
+/*
+ * columnar_relation_size(regclass) -> bigint
+ *
+ * Returns the total on-disk size in bytes of all files in the columnar
+ * stripe directory for the given relation (stripe .arrow files, delete
+ * bitmaps, stats files, and the metadata file).
+ *
+ * pg_total_relation_size() always returns 0 for columnar tables because
+ * stripe files live outside PostgreSQL's normal buffer pool.  Use this
+ * function instead.
+ *
+ * Raises an error if the relation is not a columnar table.
+ * Returns 0 if the stripe directory does not exist yet (empty table that
+ * has never been written to).
+ */
+Datum
+columnar_relation_size_sql(PG_FUNCTION_ARGS)
+{
+	Oid			relOid = PG_GETARG_OID(0);
+	Relation	rel;
+	uint64		size;
+
+	rel = table_open(relOid, AccessShareLock);
+
+	if (rel->rd_rel->relam != get_columnar_am_oid())
+	{
+		table_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation \"%s\" is not a columnar table",
+						RelationGetRelationName(rel))));
+	}
+
+	size = columnar_storage_size(RelationGetLocator(rel));
+
+	table_close(rel, AccessShareLock);
+
+	PG_RETURN_INT64((int64) size);
 }

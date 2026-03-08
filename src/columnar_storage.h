@@ -138,7 +138,7 @@ extern void columnar_set_deleted_bit(const RelFileLocator *locator,
 static inline bool
 columnar_is_deleted(const uint8_t *bits, int64_t row_offset)
 {
-	return (bits[row_offset / 8] & (1 << (row_offset % 8))) != 0;
+	return (bits[row_offset / 8] & (1u << (row_offset % 8))) != 0;
 }
 
 /* ----------------------------------------------------------------
@@ -287,5 +287,28 @@ extern void columnar_stripe_ipc_cache_insert(const RelFileLocator *locator,
  * Called from columnar_remove_storage() on DROP TABLE / TRUNCATE.
  */
 extern void columnar_stripe_ipc_cache_evict_relation(const RelFileLocator *locator);
+
+/* ----------------------------------------------------------------
+ * Cache statistics
+ * ----------------------------------------------------------------
+ */
+
+typedef struct ColumnarCacheStats
+{
+	uint64		metadata_hits;
+	uint64		metadata_misses;
+	uint64		stats_hits;
+	uint64		stats_misses;
+	uint64		bitmap_hits;
+	uint64		bitmap_misses;
+	uint64		ipc_hits;
+	uint64		ipc_misses;
+	size_t		ipc_bytes_cached;		/* current resident bytes */
+} ColumnarCacheStats;
+
+/*
+ * Fill *out with cumulative cache hit/miss counters for this backend.
+ */
+extern void columnar_get_cache_stats(ColumnarCacheStats *out);
 
 #endif /* COLUMNAR_STORAGE_H */

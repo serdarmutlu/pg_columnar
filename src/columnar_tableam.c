@@ -2,20 +2,27 @@
 
 #include "access/multixact.h"
 #include "access/parallel.h"
+#include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "commands/vacuum.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/procnumber.h"
+#include "storage/read_stream.h"
+#include "storage/smgr.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/rel.h"
 #include "utils/sampling.h"
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
+
+#include <sys/stat.h>
 
 #ifdef HAVE_LIBZSTD
 #include <zstd.h>
@@ -47,8 +54,9 @@
 #include "nodes/nodeFuncs.h"	/* exprCollation */
 #include "utils/syscache.h"		/* SearchSysCache1, ReleaseSysCache, AMNAME, RELOID */
 
-/* Forward declaration for non-static function defined later in this file */
+/* Forward declarations */
 void columnar_custom_scan_init(void);
+extern Oid get_columnar_am_oid(void);	/* defined in pg_columnar.c */
 
 /* ----------------------------------------------------------------
  * Scan descriptor for columnar tables.
@@ -383,6 +391,17 @@ columnar_open_stripe_stream(const RelFileLocator *locator,
 						(errmsg("columnar: ZSTD decompression failed: %s",
 								ZSTD_getErrorName(result))));
 			}
+			if (result != (size_t) sm->uncompressed_size)
+			{
+				pfree(file_data);
+				ArrowBufferReset(&decompressed);
+				pfree(filepath);
+				ereport(ERROR,
+						(errmsg("columnar: ZSTD decompressed %zu bytes but expected %lld "
+								"(stripe %d may be corrupt)",
+								result, (long long) sm->uncompressed_size,
+								sm->stripe_id)));
+			}
 			decompressed.size_bytes = (int64_t) result;
 #else
 			pfree(file_data);
@@ -428,6 +447,17 @@ columnar_open_stripe_stream(const RelFileLocator *locator,
 				ereport(ERROR,
 						(errmsg("columnar: LZ4 decompression failed: %s",
 								LZ4F_getErrorName(ret))));
+			}
+			if (dst_size != (size_t) sm->uncompressed_size)
+			{
+				pfree(file_data);
+				ArrowBufferReset(&decompressed);
+				pfree(filepath);
+				ereport(ERROR,
+						(errmsg("columnar: LZ4 decompressed %zu bytes but expected %lld "
+								"(stripe %d may be corrupt)",
+								dst_size, (long long) sm->uncompressed_size,
+								sm->stripe_id)));
 			}
 			decompressed.size_bytes = (int64_t) dst_size;
 #else
@@ -1816,6 +1846,30 @@ columnar_finish_bulk_insert(Relation rel, int options)
 
 	if (buf != NULL && buf->nrows > 0)
 		columnar_flush_write_buffer(buf);
+
+#if PG_VERSION_NUM >= 170000
+	{
+		/*
+		 * After flushing, ensure the smgr main fork has at least 1 page.
+		 * This covers two cases:
+		 *   1. Tables created before this code change (no smgr file yet).
+		 *   2. Tables that were TRUNCATEd (smgrtruncate removes our page).
+		 * Without this page, ANALYZE's ReadStream returns no blocks and
+		 * acquire_sample_rows produces totalrows = 0.
+		 */
+		SMgrRelation smgr = RelationGetSmgr(rel);
+
+		if (!smgrexists(smgr, MAIN_FORKNUM))
+		{
+			smgrcreate(smgr, MAIN_FORKNUM, false);
+			smgrzeroextend(smgr, MAIN_FORKNUM, 0, 1, false);
+		}
+		else if (smgrnblocks(smgr, MAIN_FORKNUM) == 0)
+		{
+			smgrzeroextend(smgr, MAIN_FORKNUM, 0, 1, false);
+		}
+	}
+#endif
 }
 
 /* ----------------------------------------------------------------
@@ -1834,6 +1888,24 @@ columnar_relation_set_new_filelocator(Relation rel,
 	*minmulti = InvalidMultiXactId;
 
 	columnar_create_storage(newrlocator);
+
+#if PG_VERSION_NUM >= 170000
+	{
+		/*
+		 * Create a single zeroed smgr page for this relation.
+		 * ANALYZE's ReadStream (acquire_sample_rows) reads smgr blocks to
+		 * drive bs.m; without a real smgr block, bs.m stays 0 and the
+		 * totalrows estimate becomes 0.  One block is enough: with
+		 * totalblocks = 1 and bs.m = 1 the formula gives
+		 *   totalrows = liverows * (totalblocks / bs.m) = liverows.
+		 */
+		SMgrRelation smgr = smgropen(*newrlocator, INVALID_PROC_NUMBER);
+
+		smgrcreate(smgr, MAIN_FORKNUM, false);
+		smgrzeroextend(smgr, MAIN_FORKNUM, 0, 1, false);
+		smgrclose(smgr);
+	}
+#endif
 }
 #else
 static void
@@ -2025,37 +2097,197 @@ columnar_relation_vacuum(Relation rel, struct VacuumParams *params,
 }
 
 /* ----------------------------------------------------------------
- * ANALYZE stubs
+ * ANALYZE support
+ *
+ * PostgreSQL 17 changed acquire_sample_rows() to drive block sampling via
+ * ReadStream.  The TAM must call read_stream_next_buffer() in
+ * scan_analyze_next_block() to advance BlockSampler's bs.m counter; without
+ * it, bs.m = 0 and the formula totalrows = (liverows/bs.m)*totalblocks
+ * produces totalrows = 0, breaking reltuples and n_distinct statistics.
+ *
+ * Strategy for PG17:
+ *   - columnar_relation_size(MAIN_FORKNUM) returns smgrnblocks * BLCKSZ
+ *     (we keep exactly 1 dummy smgr page, giving totalblocks = 1).
+ *   - analyze_next_block consumes 1 ReadStream buffer (drives bs.m = 1),
+ *     resets current_stripe = 0, returns true.  Called a second time the
+ *     ReadStream is exhausted → return false.
+ *   - analyze_next_tuple advances through ALL stripes before returning
+ *     false (one "block" = entire table).
+ *   - Result: totalrows = (liverows/1) * 1 = liverows, which is exact.
+ *
+ * For PG16 / PG15:
+ *   - acquire_sample_rows() increments bs.m itself when analyze_next_block
+ *     returns true, so we don't need to interact with any ReadStream.
+ *   - analyze_next_block opens one stripe per call.
+ *   - analyze_next_tuple reads from the currently open stripe only.
+ *   - totalblocks comes from smgrnblocks (may differ from num_stripes) so
+ *     the totalrows estimate is approximate, but column stats are still
+ *     correct.
  * ----------------------------------------------------------------
  */
 #if PG_VERSION_NUM >= 170000
 static bool
-columnar_scan_analyze_next_block(TableScanDesc scan, ReadStream *stream)
+columnar_scan_analyze_next_block(TableScanDesc sscan, ReadStream *stream)
 {
-	return false;
+	ColumnarScanDesc scan = (ColumnarScanDesc) sscan;
+	Buffer		buf;
+
+	/* Close any stripe that was open from the previous call. */
+	columnar_close_stripe(scan);
+
+	/*
+	 * Consume one ReadStream buffer to drive BlockSampler's bs.m.
+	 * This is what makes acquire_sample_rows() count this as a sampled
+	 * block.  We don't use the buffer data — columnar data lives in our
+	 * own Arrow IPC files.
+	 */
+	buf = read_stream_next_buffer(stream, NULL);
+	if (!BufferIsValid(buf))
+		return false;			/* ReadStream exhausted — done */
+
+	ReleaseBuffer(buf);
+
+	/*
+	 * Reset to the beginning of the stripe list.  analyze_next_tuple will
+	 * iterate through ALL stripes under this single "block" call, so that
+	 * the formula liverows * (totalblocks / bs.m) = liverows * (1 / 1)
+	 * gives the correct exact total-row estimate.
+	 */
+	scan->current_stripe = 0;
+	return true;
 }
 #elif PG_VERSION_NUM >= 160000
 static bool
-columnar_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno,
+columnar_scan_analyze_next_block(TableScanDesc sscan, BlockNumber blockno,
 								 BufferAccessStrategy bstrategy)
-{
-	return false;
-}
 #else
 static bool
-columnar_scan_analyze_next_block(TableScanDesc scan, BlockNumber blockno)
+columnar_scan_analyze_next_block(TableScanDesc sscan, BlockNumber blockno)
+#endif
+#if PG_VERSION_NUM < 170000
 {
-	return false;
+	ColumnarScanDesc scan = (ColumnarScanDesc) sscan;
+
+	/* Close the stripe opened by the previous call (idempotent if none). */
+	columnar_close_stripe(scan);
+
+	/* Skip fully-vacuumed (zero-row) stripes. */
+	while (scan->current_stripe < scan->num_stripes &&
+		   scan->stripe_meta[scan->current_stripe].row_count == 0)
+		scan->current_stripe++;
+
+	if (scan->current_stripe >= scan->num_stripes)
+		return false;
+
+	columnar_open_stripe(scan, scan->current_stripe);
+	scan->current_stripe++;
+	return true;
 }
 #endif
 
 static bool
-columnar_scan_analyze_next_tuple(TableScanDesc scan,
+columnar_scan_analyze_next_tuple(TableScanDesc sscan,
 								 TransactionId OldestXmin,
 								 double *liverows, double *deadrows,
 								 TupleTableSlot *slot)
 {
-	return false;
+	ColumnarScanDesc scan = (ColumnarScanDesc) sscan;
+	TupleDesc	tupdesc = RelationGetDescr(sscan->rs_rd);
+	struct ArrowError arrow_error;
+
+	ExecClearTuple(slot);
+
+	for (;;)
+	{
+		/* Return a row from the current batch if one is available. */
+		if (scan->has_batch && scan->batch_row_index < scan->batch_length)
+		{
+			int64_t		row = scan->batch_row_index++;
+
+			if (scan->current_delete_bitmap != NULL &&
+				columnar_is_deleted(scan->current_delete_bitmap, row))
+			{
+				*deadrows += 1;
+				continue;
+			}
+
+			columnar_populate_slot(slot, &scan->batch_view, row, tupdesc);
+			ItemPointerSet(&slot->tts_tid,
+						   (BlockNumber) scan->current_stripe,
+						   (OffsetNumber) (row + 1));
+			ExecStoreVirtualTuple(slot);
+			*liverows += 1;
+			return true;
+		}
+
+		/* Try to get the next batch from the currently open stream. */
+		if (scan->stream_open)
+		{
+			struct ArrowArray next_batch;
+			int			rc;
+
+			memset(&next_batch, 0, sizeof(next_batch));
+			rc = scan->arrow_stream.get_next(&scan->arrow_stream, &next_batch);
+
+			if (rc == 0 && next_batch.release != NULL)
+			{
+				if (scan->has_batch)
+				{
+					if (scan->batch_view_valid)
+					{
+						ArrowArrayViewReset(&scan->batch_view);
+						scan->batch_view_valid = false;
+					}
+					if (scan->current_batch.release)
+						scan->current_batch.release(&scan->current_batch);
+				}
+
+				scan->current_batch = next_batch;
+				scan->batch_row_index = 0;
+				scan->batch_length = next_batch.length;
+				scan->has_batch = true;
+
+				ArrowArrayViewInitFromSchema(&scan->batch_view,
+											&scan->arrow_schema,
+											&arrow_error);
+				rc = ArrowArrayViewSetArray(&scan->batch_view,
+										   &scan->current_batch,
+										   &arrow_error);
+				if (rc != NANOARROW_OK)
+					ereport(ERROR,
+							(errmsg("columnar analyze: failed to set batch view: %s",
+									arrow_error.message)));
+				scan->batch_view_valid = true;
+				continue;
+			}
+
+			/* Stream exhausted for this stripe. */
+			columnar_close_stripe(scan);
+		}
+
+#if PG_VERSION_NUM >= 170000
+		/*
+		 * PG17: advance to the next non-empty stripe and keep going.
+		 * All stripes are scanned under the single ReadStream "block",
+		 * so we must not return false until everything is consumed.
+		 */
+		while (scan->current_stripe < scan->num_stripes)
+		{
+			if (scan->stripe_meta[scan->current_stripe].row_count > 0)
+			{
+				columnar_open_stripe(scan, scan->current_stripe);
+				scan->current_stripe++;
+				break;
+			}
+			scan->current_stripe++;
+		}
+		if (scan->stream_open)
+			continue;
+#endif
+
+		/* All stripes (PG17) or current stripe (PG16/15) fully consumed. */
+		return false;
+	}
 }
 
 /* ----------------------------------------------------------------
@@ -2161,7 +2393,30 @@ columnar_relation_size(Relation rel, ForkNumber forkNumber)
 	if (forkNumber != MAIN_FORKNUM)
 		return 0;
 
+#if PG_VERSION_NUM >= 170000
+	{
+		/*
+		 * Return the number of smgr blocks * BLCKSZ so that
+		 * RelationGetNumberOfBlocks() = smgr page count.
+		 *
+		 * We maintain exactly 1 smgr page (created in
+		 * columnar_relation_set_new_filelocator, refreshed in
+		 * columnar_finish_bulk_insert).  This keeps totalblocks = 1,
+		 * so ANALYZE's formula totalrows = liverows * (totalblocks/bs.m)
+		 * evaluates to totalrows = liverows, which is exact.
+		 *
+		 * After TRUNCATE the smgr page is removed by smgrtruncate; we
+		 * return 0 which causes ANALYZE to correctly report 0 rows.
+		 */
+		SMgrRelation smgr = RelationGetSmgr(rel);
+
+		if (!smgrexists(smgr, MAIN_FORKNUM))
+			return 0;
+		return (uint64) smgrnblocks(smgr, MAIN_FORKNUM) * BLCKSZ;
+	}
+#else
 	return columnar_storage_size(RelationGetLocator(rel));
+#endif
 }
 
 static bool
@@ -2679,3 +2934,566 @@ const TableAmRoutine columnar_am_methods = {
 	.scan_sample_next_block = columnar_scan_sample_next_block,
 	.scan_sample_next_tuple = columnar_scan_sample_next_tuple,
 };
+
+/* ----------------------------------------------------------------
+ * Phase 3 compaction
+ *
+ * columnar_compact(regclass) rewrites every partially-deleted stripe,
+ * keeping only surviving rows.  The algorithm:
+ *
+ *   Phase 0  Flush any open write buffer so the first new stripe block
+ *            number is predictable.
+ *
+ *   Phase 1  For each partially-deleted stripe (0 < deleted < row_count):
+ *              - Open the stripe, read the ArrowArray batch.
+ *              - For each non-deleted row call columnar_tuple_insert().
+ *                The write buffer auto-flushes at 10 000 rows; each
+ *                flush appends a new stripe to the metadata.
+ *
+ *   Phase 2  Final flush of any remaining write-buffer rows.
+ *
+ *   Phase 3  Zero out every compacted stripe in metadata (row_count = 0,
+ *            remove .arrow / .deleted / .stats files, evict caches).
+ *
+ *   Phase 4  For each new stripe created in phases 1-2, insert index
+ *            entries for every row using FormIndexDatum + index_insert
+ *            (same machinery as columnar_index_build_range_scan, but
+ *            scoped to the new stripes only).
+ *
+ * Index entries for the old (now zeroed) stripes become stale.  They
+ * are silently skipped by columnar_index_fetch_tuple because zeroed
+ * stripes have row_count = 0.  They will be cleaned up by a subsequent
+ * REINDEX (or can be left harmlessly in place).
+ *
+ * Lock: ExclusiveLock — prevents concurrent reads/writes for the
+ * duration.  A future improvement could use a non-blocking approach.
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * Build index entries for all rows in stripes at positions
+ * [first_new_stripe_idx, final_meta->num_stripes) in the metadata array.
+ *
+ * BlockNumber for position i (0-based) = i + 1 (1-based), matching
+ * the TIDs assigned by columnar_tuple_insert during Phase 1.
+ */
+static void
+columnar_compact_rebuild_indexes(Relation rel,
+								 const RelFileLocator *locator,
+								 int first_new_stripe_idx,
+								 ColumnarMetadata *final_meta)
+{
+	List	   *indexOids;
+	ListCell   *lc;
+	EState	   *estate;
+	TupleTableSlot *slot;
+	ExprContext *econtext;
+
+	indexOids = RelationGetIndexList(rel);
+	if (indexOids == NIL)
+		return;
+
+	estate = CreateExecutorState();
+	slot = table_slot_create(rel, NULL);
+	econtext = GetPerTupleExprContext(estate);
+	econtext->ecxt_scantuple = slot;
+
+	foreach(lc, indexOids)
+	{
+		Oid			indexOid = lfirst_oid(lc);
+		Relation	indexRel;
+		IndexInfo  *indexInfo;
+		int			i;
+
+		indexRel = index_open(indexOid, RowExclusiveLock);
+		indexInfo = BuildIndexInfo(indexRel);
+
+		for (i = first_new_stripe_idx; i < final_meta->num_stripes; i++)
+		{
+			StripeMetadata *sm = &final_meta->stripes[i];
+			struct ArrowArrayStream stream;
+			struct ArrowSchema schema;
+			struct ArrowArray batch;
+			struct ArrowArrayView batch_view;
+			struct ArrowError arrow_error;
+			int64_t		row;
+			int			rc;
+
+			if (sm->row_count == 0)
+				continue;
+
+			columnar_open_stripe_stream(locator, sm, &stream, &schema);
+
+			rc = stream.get_next(&stream, &batch);
+			if (rc != NANOARROW_OK)
+			{
+				stream.release(&stream);
+				schema.release(&schema);
+				ereport(WARNING,
+						(errmsg("columnar_compact: failed to read new stripe %d "
+								"during index build, skipping", sm->stripe_id)));
+				continue;
+			}
+
+			ArrowArrayViewInitFromSchema(&batch_view, &schema, &arrow_error);
+			rc = ArrowArrayViewSetArray(&batch_view, &batch, &arrow_error);
+			if (rc != NANOARROW_OK)
+			{
+				batch.release(&batch);
+				schema.release(&schema);
+				stream.release(&stream);
+				ereport(WARNING,
+						(errmsg("columnar_compact: failed to build array view "
+								"for new stripe %d, skipping", sm->stripe_id)));
+				continue;
+			}
+
+			for (row = 0; row < sm->row_count; row++)
+			{
+				Datum		values[INDEX_MAX_KEYS];
+				bool		isnull[INDEX_MAX_KEYS];
+				ItemPointerData tid;
+
+				CHECK_FOR_INTERRUPTS();
+
+				/*
+				 * BlockNumber = 1-based array position = i + 1.
+				 * OffsetNumber = 1-based row offset = row + 1.
+				 * This matches the TIDs assigned by columnar_tuple_insert.
+				 */
+				ItemPointerSet(&tid,
+							   (BlockNumber)(i + 1),
+							   (OffsetNumber)(row + 1));
+
+				ExecClearTuple(slot);
+				columnar_populate_slot(slot, &batch_view, row,
+									   RelationGetDescr(rel));
+				ExecStoreVirtualTuple(slot);
+				slot->tts_tid = tid;
+
+				FormIndexDatum(indexInfo, slot, estate, values, isnull);
+				index_insert(indexRel, values, isnull, &tid,
+							 rel, UNIQUE_CHECK_NO, false, indexInfo);
+			}
+
+			ArrowArrayViewReset(&batch_view);
+			batch.release(&batch);
+			schema.release(&schema);
+			stream.release(&stream);
+		}
+
+		index_close(indexRel, RowExclusiveLock);
+	}
+
+	ExecDropSingleTupleTableSlot(slot);
+	FreeExecutorState(estate);
+	list_free(indexOids);
+}
+
+PG_FUNCTION_INFO_V1(columnar_compact);
+
+/*
+ * columnar_compact(regclass) -> record(stripes_compacted int, rows_compacted bigint)
+ */
+Datum
+columnar_compact(PG_FUNCTION_ARGS)
+{
+	Oid			relOid = PG_GETARG_OID(0);
+	Relation	rel;
+	const RelFileLocator *locator;
+	ColumnarMetadata *meta;
+	int			original_num_stripes;
+	int			stripes_compacted = 0;
+	int64_t		rows_compacted = 0;
+
+	/* stripes chosen for compaction — tracked so Phase 3 knows which to zero */
+	int		   *compact_ids;
+	int			ncompact = 0;
+
+	TupleDesc	tupdesc;
+	Datum		values[2];
+	bool		isnull[2] = {false, false};
+
+	rel = table_open(relOid, ExclusiveLock);
+
+	if (rel->rd_rel->relam != get_columnar_am_oid())
+	{
+		table_close(rel, ExclusiveLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation \"%s\" is not a columnar table",
+						RelationGetRelationName(rel))));
+	}
+
+	locator = RelationGetLocator(rel);
+
+	/* Phase 0: flush any in-progress write buffer so wb_stripe_block is fresh */
+	{
+		ColumnarWriteBuffer *existing = columnar_find_write_buffer(rel);
+
+		if (existing != NULL && existing->nrows > 0)
+			columnar_flush_write_buffer(existing);
+	}
+
+	meta = columnar_read_metadata(locator);
+	original_num_stripes = meta->num_stripes;
+
+	compact_ids = palloc(sizeof(int) * original_num_stripes);
+
+	/* Phase 1: copy surviving rows from each partially-deleted stripe */
+	for (int i = 0; i < original_num_stripes; i++)
+	{
+		StripeMetadata *sm = &meta->stripes[i];
+		uint8_t    *bitmap;
+		int64_t		nbytes,
+					deleted,
+					b;
+		struct ArrowArrayStream stream;
+		struct ArrowSchema schema;
+		struct ArrowArray batch;
+		struct ArrowArrayView batch_view;
+		struct ArrowError arrow_error;
+		TupleTableSlot *slot;
+		int64_t		row;
+		int			rc;
+
+		if (sm->row_count == 0)
+			continue;				/* already fully vacuumed */
+
+		bitmap = columnar_read_delete_bitmap(locator, sm->stripe_id,
+											 sm->row_count);
+		if (bitmap == NULL)
+			continue;				/* no deletions in this stripe */
+
+		/* Count set bits */
+		nbytes = (sm->row_count + 7) / 8;
+		deleted = 0;
+		for (b = 0; b < nbytes; b++)
+			deleted += __builtin_popcount(bitmap[b]);
+
+		if (deleted == 0)
+		{
+			pfree(bitmap);
+			continue;
+		}
+		if (deleted == sm->row_count)
+		{
+			pfree(bitmap);
+			continue;				/* fully deleted; VACUUM will clean this up */
+		}
+
+		/* Open the stripe and read its single RecordBatch */
+		columnar_open_stripe_stream(locator, sm, &stream, &schema);
+
+		rc = stream.get_next(&stream, &batch);
+		if (rc != NANOARROW_OK)
+		{
+			stream.release(&stream);
+			schema.release(&schema);
+			pfree(bitmap);
+			ereport(WARNING,
+					(errmsg("columnar_compact: failed to read stripe %d, skipping",
+							sm->stripe_id)));
+			continue;
+		}
+
+		ArrowArrayViewInitFromSchema(&batch_view, &schema, &arrow_error);
+		rc = ArrowArrayViewSetArray(&batch_view, &batch, &arrow_error);
+		if (rc != NANOARROW_OK)
+		{
+			batch.release(&batch);
+			schema.release(&schema);
+			stream.release(&stream);
+			pfree(bitmap);
+			ereport(WARNING,
+					(errmsg("columnar_compact: array view failed for stripe %d, skipping",
+							sm->stripe_id)));
+			continue;
+		}
+
+		slot = MakeSingleTupleTableSlot(RelationGetDescr(rel), &TTSOpsVirtual);
+
+		for (row = 0; row < sm->row_count; row++)
+		{
+			if (columnar_is_deleted(bitmap, row))
+				continue;
+
+			ExecClearTuple(slot);
+			columnar_populate_slot(slot, &batch_view, row, RelationGetDescr(rel));
+			ExecStoreVirtualTuple(slot);
+
+			/* columnar_tuple_insert assigns the new TID to slot->tts_tid */
+			columnar_tuple_insert(rel, slot, 0, 0, NULL);
+			rows_compacted++;
+		}
+
+		ExecDropSingleTupleTableSlot(slot);
+		ArrowArrayViewReset(&batch_view);
+		batch.release(&batch);
+		schema.release(&schema);
+		stream.release(&stream);
+		pfree(bitmap);
+
+		compact_ids[ncompact++] = sm->stripe_id;
+		stripes_compacted++;
+	}
+
+	/* Phase 2: final flush of remaining write-buffer rows */
+	{
+		ColumnarWriteBuffer *buf = columnar_find_write_buffer(rel);
+
+		if (buf != NULL && buf->nrows > 0)
+			columnar_flush_write_buffer(buf);
+	}
+
+	/* Phase 3: zero out the old compacted stripes */
+	if (ncompact > 0)
+	{
+		ColumnarMetadata *updated;
+		bool		changed = false;
+
+		updated = columnar_read_metadata(locator);
+
+		for (int i = 0; i < original_num_stripes; i++)
+		{
+			StripeMetadata *sm = &updated->stripes[i];
+			int			j;
+			bool		was_compacted = false;
+
+			for (j = 0; j < ncompact; j++)
+			{
+				if (compact_ids[j] == sm->stripe_id)
+				{
+					was_compacted = true;
+					break;
+				}
+			}
+			if (!was_compacted)
+				continue;
+
+			/* Remove companion files */
+			{
+				char	   *ap = columnar_stripe_path(locator, sm->stripe_id);
+				char	   *dp = columnar_deleted_path(locator, sm->stripe_id);
+				char	   *sp = columnar_stats_path(locator, sm->stripe_id);
+
+				unlink(ap);
+				unlink(dp);
+				unlink(sp);
+				pfree(ap);
+				pfree(dp);
+				pfree(sp);
+			}
+
+			/* Evict per-stripe caches */
+			columnar_stats_cache_evict_stripe(locator, sm->stripe_id);
+			columnar_bitmap_cache_evict_stripe(locator, sm->stripe_id);
+
+			updated->total_rows -= sm->row_count;
+			sm->row_count = 0;
+			sm->file_size = 0;
+			changed = true;
+		}
+
+		if (changed)
+			columnar_write_metadata(locator, updated);
+
+		if (updated->stripes)
+			pfree(updated->stripes);
+		pfree(updated);
+	}
+
+	/* Phase 4: build index entries for the new stripes */
+	if (stripes_compacted > 0)
+	{
+		ColumnarMetadata *final_meta = columnar_read_metadata(locator);
+
+		columnar_compact_rebuild_indexes(rel, locator,
+										 original_num_stripes, final_meta);
+
+		if (final_meta->stripes)
+			pfree(final_meta->stripes);
+		pfree(final_meta);
+	}
+
+	pfree(compact_ids);
+	if (meta->stripes)
+		pfree(meta->stripes);
+	pfree(meta);
+
+	table_close(rel, ExclusiveLock);
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("columnar_compact must be called as a set-returning function")));
+
+	values[0] = Int32GetDatum(stripes_compacted);
+	values[1] = Int64GetDatum(rows_compacted);
+	tupdesc = BlessTupleDesc(tupdesc);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, isnull)));
+}
+
+/* ----------------------------------------------------------------
+ * SQL-callable diagnostic functions
+ * ----------------------------------------------------------------
+ */
+
+PG_FUNCTION_INFO_V1(columnar_stripe_info);
+PG_FUNCTION_INFO_V1(columnar_cache_stats);
+
+/*
+ * columnar_stripe_info(regclass) -> SETOF record
+ *
+ * Returns one row per stripe with:
+ *   stripe_id    int4
+ *   row_count    int8
+ *   file_size    int8  (bytes; 0 for fully-vacuumed stripes)
+ *   compression  text  ('none' | 'lz4' | 'zstd')
+ *   deleted_rows int8  (rows with their delete-bitmap bit set)
+ *   has_stats    bool  (true when a .stats file exists for this stripe)
+ */
+typedef struct ColumnarStripeInfoCtx
+{
+	ColumnarMetadata *meta;
+	RelFileLocator	 locator;
+	int				 idx;		/* next stripe to emit */
+} ColumnarStripeInfoCtx;
+
+Datum
+columnar_stripe_info(PG_FUNCTION_ARGS)
+{
+	FuncCallContext		*funcctx;
+	ColumnarStripeInfoCtx *ctx;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext	oldctx;
+		Oid				relOid = PG_GETARG_OID(0);
+		Relation		rel;
+		TupleDesc		tupdesc;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		rel = table_open(relOid, AccessShareLock);
+		if (rel->rd_rel->relam != get_columnar_am_oid())
+		{
+			table_close(rel, AccessShareLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("relation \"%s\" is not a columnar table",
+							RelationGetRelationName(rel))));
+		}
+
+		ctx = palloc(sizeof(ColumnarStripeInfoCtx));
+		ctx->locator = *RelationGetLocator(rel);
+		ctx->meta    = columnar_read_metadata(&ctx->locator);
+		ctx->idx     = 0;
+		table_close(rel, AccessShareLock);
+
+		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("columnar_stripe_info must be called as a set-returning function")));
+
+		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+		funcctx->user_fctx  = ctx;
+		MemoryContextSwitchTo(oldctx);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	ctx = (ColumnarStripeInfoCtx *) funcctx->user_fctx;
+
+	while (ctx->idx < ctx->meta->num_stripes)
+	{
+		StripeMetadata *sm = &ctx->meta->stripes[ctx->idx++];
+		Datum		values[6];
+		bool		isnull[6] = {false, false, false, false, false, false};
+		HeapTuple	tuple;
+		int64_t		deleted_rows = 0;
+		const char *comp_name;
+		struct stat st_buf;
+		char	   *statspath;
+
+		/* compression label */
+		switch (sm->compression)
+		{
+			case COLUMNAR_COMPRESSION_LZ4:  comp_name = "lz4";  break;
+			case COLUMNAR_COMPRESSION_ZSTD: comp_name = "zstd"; break;
+			default:                        comp_name = "none";  break;
+		}
+
+		/* count deleted rows from the bitmap */
+		if (sm->row_count > 0)
+		{
+			uint8_t *bitmap = columnar_read_delete_bitmap(
+				&ctx->locator, sm->stripe_id, sm->row_count);
+
+			if (bitmap != NULL)
+			{
+				int64_t nbytes = (sm->row_count + 7) / 8;
+				int64_t b;
+
+				for (b = 0; b < nbytes; b++)
+					deleted_rows += __builtin_popcount(bitmap[b]);
+				pfree(bitmap);
+			}
+		}
+
+		/* check for .stats file */
+		statspath = columnar_stats_path(&ctx->locator, sm->stripe_id);
+		values[5] = BoolGetDatum(stat(statspath, &st_buf) == 0);
+		pfree(statspath);
+
+		values[0] = Int32GetDatum(sm->stripe_id);
+		values[1] = Int64GetDatum(sm->row_count);
+		values[2] = Int64GetDatum(sm->file_size);
+		values[3] = CStringGetTextDatum(comp_name);
+		values[4] = Int64GetDatum(deleted_rows);
+		/* values[5] already set above */
+
+		tuple = heap_form_tuple(funcctx->tuple_desc, values, isnull);
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+	}
+
+	SRF_RETURN_DONE(funcctx);
+}
+
+/*
+ * columnar_cache_stats() -> record
+ *
+ * Returns a single row with cumulative cache hit/miss counters for the
+ * current backend plus the number of bytes currently resident in the
+ * stripe IPC bytes cache.
+ */
+Datum
+columnar_cache_stats(PG_FUNCTION_ARGS)
+{
+	TupleDesc		tupdesc;
+	Datum			values[9];
+	bool			isnull[9] = {false};
+	HeapTuple		tuple;
+	ColumnarCacheStats cs;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("columnar_cache_stats must be called as a set-returning function")));
+
+	columnar_get_cache_stats(&cs);
+
+	values[0] = Int64GetDatum((int64) cs.metadata_hits);
+	values[1] = Int64GetDatum((int64) cs.metadata_misses);
+	values[2] = Int64GetDatum((int64) cs.stats_hits);
+	values[3] = Int64GetDatum((int64) cs.stats_misses);
+	values[4] = Int64GetDatum((int64) cs.bitmap_hits);
+	values[5] = Int64GetDatum((int64) cs.bitmap_misses);
+	values[6] = Int64GetDatum((int64) cs.ipc_hits);
+	values[7] = Int64GetDatum((int64) cs.ipc_misses);
+	values[8] = Int64GetDatum((int64) cs.ipc_bytes_cached);
+
+	tupdesc = BlessTupleDesc(tupdesc);
+	tuple   = heap_form_tuple(tupdesc, values, isnull);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}

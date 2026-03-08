@@ -6,20 +6,20 @@ Stripe files are standard Arrow IPC and can be read by DuckDB, Pandas, Polars, P
 
 ## Prerequisites
 
-- **PostgreSQL 17** (with development headers)
+- **PostgreSQL 14, 15, 16, or 17** (with development headers). PostgreSQL 18 support is planned once PG18 reaches general availability.
 - **No external Arrow library required** -- [nanoarrow](https://github.com/apache/arrow-nanoarrow) v0.7.0 is vendored in the source tree
 - **Optional compression libraries** (detected automatically at build time):
   - [zstd](https://github.com/facebook/zstd) -- best compression ratio
   - [lz4](https://github.com/lz4/lz4) -- fastest compression/decompression
 
-On macOS with Homebrew:
+On macOS with Homebrew (replace `17` with your installed major version):
 
 ```bash
 brew install postgresql@17
 brew install zstd lz4    # optional, for compression support
 ```
 
-On Debian/Ubuntu:
+On Debian/Ubuntu (replace `17` with your installed major version):
 
 ```bash
 sudo apt install postgresql-17 postgresql-server-dev-17

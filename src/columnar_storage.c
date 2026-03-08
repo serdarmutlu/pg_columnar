@@ -73,6 +73,16 @@ typedef struct ColumnarMetadataCacheEntry
 static HTAB *metadata_cache = NULL;
 static MemoryContext metadata_cache_ctx = NULL;
 
+/* Per-backend cache hit/miss counters */
+static uint64 metadata_cache_hits   = 0;
+static uint64 metadata_cache_misses = 0;
+static uint64 stats_cache_hits      = 0;
+static uint64 stats_cache_misses    = 0;
+static uint64 bitmap_cache_hits     = 0;
+static uint64 bitmap_cache_misses   = 0;
+static uint64 ipc_cache_hits        = 0;
+static uint64 ipc_cache_misses      = 0;
+
 /*
  * Initialize the metadata cache.  Called lazily on first use.
  */
@@ -746,8 +756,12 @@ columnar_stripe_ipc_cache_lookup(const RelFileLocator *locator,
 
 	entry = hash_search(stripe_ipc_cache, &key, HASH_FIND, &found);
 	if (!found || entry->ipc_bytes == NULL)
+	{
+		ipc_cache_misses++;
 		return NULL;
+	}
 
+	ipc_cache_hits++;
 	entry->lru_clock = ++stripe_ipc_lru_clock;
 	*out_size = entry->ipc_size;
 
@@ -1021,6 +1035,7 @@ columnar_read_metadata(const RelFileLocator *locator)
 		if (found)
 		{
 			ColumnarMetadata *result = palloc(sizeof(ColumnarMetadata));
+			metadata_cache_hits++;
 
 			result->num_stripes = centry->num_stripes;
 			result->total_rows = centry->total_rows;
@@ -1037,6 +1052,7 @@ columnar_read_metadata(const RelFileLocator *locator)
 	}
 
 	/* Cache miss — read from the metadata file on disk. */
+	metadata_cache_misses++;
 	metapath = columnar_metadata_path(locator);
 	meta = palloc0(sizeof(ColumnarMetadata));
 
@@ -1071,6 +1087,10 @@ columnar_read_metadata(const RelFileLocator *locator)
 
 			if (fgets(line, sizeof(line), fp) == NULL)
 			{
+				ereport(WARNING,
+						(errmsg("columnar metadata file appears truncated: "
+								"header declared %d stripes but only %d found",
+								meta->num_stripes, i)));
 				meta->num_stripes = i;
 				break;
 			}
@@ -1089,6 +1109,9 @@ columnar_read_metadata(const RelFileLocator *locator)
 			}
 			else if (fields != 5)
 			{
+				ereport(WARNING,
+						(errmsg("columnar metadata file has unparseable entry "
+								"at stripe %d (line \"%s\")", i, line)));
 				meta->num_stripes = i;
 				break;
 			}
@@ -1108,14 +1131,26 @@ void
 columnar_write_metadata(const RelFileLocator *locator, ColumnarMetadata *meta)
 {
 	char	   *metapath = columnar_metadata_path(locator);
+	char	   *tmppath;
 	FILE	   *fp;
 	int			i;
 
-	fp = fopen(metapath, "w");
+	/*
+	 * Write to a temp file first, then rename over the real metadata file.
+	 * rename(2) is atomic on POSIX filesystems, so a crash mid-write cannot
+	 * leave the metadata file in a partially-written state.
+	 */
+	tmppath = palloc(MAXPGPATH);
+	snprintf(tmppath, MAXPGPATH, "%s.tmp", metapath);
+
+	fp = fopen(tmppath, "w");
 	if (fp == NULL)
+	{
+		pfree(tmppath);
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not write columnar metadata \"%s\": %m", metapath)));
+				 errmsg("could not write columnar metadata \"%s\": %m", tmppath)));
+	}
 
 	fprintf(fp, "%d %" PRId64 "\n", meta->num_stripes, meta->total_rows);
 	for (i = 0; i < meta->num_stripes; i++)
@@ -1128,7 +1163,26 @@ columnar_write_metadata(const RelFileLocator *locator, ColumnarMetadata *meta)
 				meta->stripes[i].uncompressed_size);
 	}
 
-	fclose(fp);
+	if (fflush(fp) != 0 || fclose(fp) != 0)
+	{
+		unlink(tmppath);
+		pfree(tmppath);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not flush columnar metadata \"%s\": %m", tmppath)));
+	}
+
+	if (rename(tmppath, metapath) != 0)
+	{
+		unlink(tmppath);
+		pfree(tmppath);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not rename columnar metadata \"%s\" to \"%s\": %m",
+						tmppath, metapath)));
+	}
+
+	pfree(tmppath);
 	pfree(metapath);
 
 	/*
@@ -1380,6 +1434,7 @@ columnar_read_stripe_stats(const RelFileLocator *locator,
 		centry = hash_search(stats_cache, &ckey, HASH_FIND, &found);
 		if (found)
 		{
+			stats_cache_hits++;
 			/* File confirmed absent (pre-Level-3 stripe) */
 			if (centry->file_absent)
 				return NULL;
@@ -1407,6 +1462,7 @@ columnar_read_stripe_stats(const RelFileLocator *locator,
 	}
 
 	/* Cache miss — read the .stats file from disk */
+	stats_cache_misses++;
 	path = columnar_stats_path(locator, stripe_id);
 	fp = fopen(path, "r");
 	pfree(path);
@@ -1734,6 +1790,7 @@ columnar_read_delete_bitmap(const RelFileLocator *locator,
 		centry = hash_search(bitmap_cache, &ckey, HASH_FIND, &found);
 		if (found)
 		{
+			bitmap_cache_hits++;
 			/* Stripe has no deletions (confirmed by a previous fopen miss) */
 			if (centry->file_absent)
 				return NULL;
@@ -1746,6 +1803,7 @@ columnar_read_delete_bitmap(const RelFileLocator *locator,
 	}
 
 	/* Cache miss — read the .deleted file from disk */
+	bitmap_cache_misses++;
 	path = columnar_deleted_path(locator, stripe_id);
 	fp = fopen(path, "rb");
 	pfree(path);
@@ -1829,7 +1887,7 @@ columnar_set_deleted_bit(const RelFileLocator *locator,
 	}
 
 	/* Set the bit for this row */
-	bits[row_offset / 8] |= (uint8_t) (1 << (row_offset % 8));
+	bits[row_offset / 8] |= (uint8_t) (1u << (row_offset % 8));
 
 	/* Write the updated bitmap back */
 	fp = fopen(path, "wb");
@@ -1903,4 +1961,22 @@ columnar_storage_size(const RelFileLocator *locator)
 	closedir(dir);
 	pfree(dirpath);
 	return total;
+}
+
+/*
+ * Fill *out with cumulative cache hit/miss counters for this backend.
+ * ipc_bytes_cached is the current number of bytes resident in the IPC cache.
+ */
+void
+columnar_get_cache_stats(ColumnarCacheStats *out)
+{
+	out->metadata_hits    = metadata_cache_hits;
+	out->metadata_misses  = metadata_cache_misses;
+	out->stats_hits       = stats_cache_hits;
+	out->stats_misses     = stats_cache_misses;
+	out->bitmap_hits      = bitmap_cache_hits;
+	out->bitmap_misses    = bitmap_cache_misses;
+	out->ipc_hits         = ipc_cache_hits;
+	out->ipc_misses       = ipc_cache_misses;
+	out->ipc_bytes_cached = stripe_ipc_total_bytes;
 }
