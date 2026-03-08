@@ -438,7 +438,7 @@ daemon and by explicit `VACUUM` commands.
 4. **Partially-deleted stripes** (`0 < deleted_rows < row_count`):
    - **No file rewriting.** Rewriting the stripe would shift row offsets for surviving
      rows and invalidate their TIDs in existing indexes. Full compaction (stripe
-     rewrite + index rebuild) is deferred to Phase 3.
+     rewrite + index rebuild) is performed by `columnar_compact()`.
    - The `.deleted` bitmap file is kept in place.
    - The surviving row count is subtracted from `total_rows`.
 5. **Rewrites the metadata file** if any stripes changed.
@@ -458,8 +458,108 @@ daemon and by explicit `VACUUM` commands.
 | Case | After VACUUM |
 |---|---|
 | Fully-deleted stripe | `.arrow` + `.deleted` files removed; full space reclaimed |
-| Partially-deleted stripe | `.arrow` kept; space proportional to deleted rows **not** reclaimed until Phase 3 |
+| Partially-deleted stripe | `.arrow` kept; space not reclaimed until `columnar_compact()` |
 | Updated rows | Old TID's space not reclaimed (same as partially-deleted); new row appended as normal insert |
+
+---
+
+## Phase 3 — Stripe Compaction
+
+`columnar_compact(regclass)` is a SQL-callable function that reclaims space from
+partially-deleted stripes without rebuilding indexes.
+
+### What compaction does
+
+1. **Iterates partially-deleted stripes** (`0 < deleted_rows < row_count`).
+   Fully-deleted stripes are skipped — they are handled by VACUUM.
+2. For each such stripe, reads the Arrow RecordBatch and delete bitmap, then
+   re-inserts every surviving row into the write buffer via `columnar_tuple_insert`.
+3. Flushes the write buffer after each stripe → produces a new compact stripe at
+   the end of the metadata array containing only live rows.
+4. Zeroes the original stripe's metadata entry (`row_count = 0`, `file_size = 0`)
+   and removes its `.arrow`, `.deleted`, and `.stats` files from disk.
+   **The zeroed entry is kept in the array** (TID stability — same reason as VACUUM).
+5. Rebuilds index entries for all surviving rows by calling `index_insert` on every
+   live index of the relation.
+6. Returns a record `(stripes_compacted int, rows_compacted int)`.
+
+### TID implications
+
+After compaction, old TIDs pointing into the compacted stripe are no longer valid —
+the stripe entry is zeroed, so index lookups for those TIDs return `false` immediately.
+The newly written rows have fresh TIDs pointing to the new stripe at the end. New index
+entries are built for the new TIDs inside `columnar_compact` itself.
+
+### Usage
+
+```sql
+-- Compact all partially-deleted stripes in a table
+SELECT * FROM columnar_compact('orders_columnar');
+-- Returns: (stripes_compacted, rows_compacted)
+
+-- Typical workflow: VACUUM first (removes fully-deleted), then compact (rewrites partials)
+VACUUM orders_columnar;
+SELECT * FROM columnar_compact('orders_columnar');
+```
+
+---
+
+## ANALYZE
+
+`ANALYZE` is fully implemented and populates both `pg_statistic` (column statistics)
+and `pg_class.reltuples` (row count estimate used by the planner).
+
+### PG17 implementation — smgr + ReadStream strategy
+
+PG17's `acquire_sample_rows` uses a `BlockSampler` driven by `ReadStream`. The formula
+for estimated total rows is:
+
+```
+totalrows = (liverows / bs.m) * totalblocks
+```
+
+where `bs.m` increments only when the TAM calls `read_stream_next_buffer` inside
+`scan_analyze_next_block`. A custom TAM that never calls `read_stream_next_buffer`
+gets `bs.m = 0` → `totalrows = 0` → `reltuples = 0` and `n_distinct = -Infinity`.
+
+**Solution:** maintain one dummy smgr page per columnar table so ReadStream has a
+real block to hand out. With `totalblocks = 1` and `bs.m = 1`:
+`totalrows = (liverows / 1) * 1 = liverows` (exact count, not a sample estimate).
+
+**smgr lifecycle:**
+- **Created** in `columnar_relation_set_new_filelocator` (PG17 only): `smgrcreate` +
+  `smgrzeroextend(MAIN_FORKNUM, block=0, count=1)`.
+- **Refreshed** in `columnar_finish_bulk_insert` (PG17 only): if the smgr page was
+  removed by `smgrtruncate` (e.g., after TRUNCATE), it is re-created automatically
+  after the next INSERT/COPY.
+- **Dropped** automatically by PostgreSQL's `RelationDropStorage` on DROP TABLE.
+
+**`columnar_relation_size(MAIN_FORKNUM)`** (PG17 only): returns
+`smgrnblocks(smgr, MAIN_FORKNUM) * BLCKSZ` instead of the actual columnar byte count.
+This keeps `totalblocks` at 1 (the dummy page), which is required for the formula above.
+
+### Scan callbacks
+
+- **`columnar_scan_analyze_next_block` (PG17):** calls `read_stream_next_buffer`,
+  releases the buffer, resets `current_stripe = 0`, returns true/false. All stripes are
+  processed under this single "block".
+- **`columnar_scan_analyze_next_tuple` (PG17):** advances through ALL stripes in one call
+  chain. After exhausting each stripe's RecordBatch it opens the next non-empty stripe and
+  continues; returns false only when all stripes are done.
+- **Delete bitmap awareness:** deleted rows are counted as `deadrows`, live rows as
+  `liverows`, matching heap ANALYZE semantics.
+
+### PG16/15 implementation
+
+One stripe per `analyze_next_block` call (no ReadStream involved). Works with the
+previous stripe-as-block mapping.
+
+### Result
+
+After `ANALYZE orders_columnar`:
+- `pg_class.reltuples` = exact live row count
+- `pg_statistic` populated with `n_distinct`, `most_common_vals`, histograms, etc.
+- Planner can make accurate cardinality estimates for columnar tables
 
 ---
 
@@ -512,24 +612,24 @@ if (IsParallelWorker() && pscan != NULL)
 - **No MVCC.** All rows are always visible; there is no snapshot isolation or
   per-transaction visibility. Concurrent DML from two sessions can see each other's
   changes immediately.
-- **DELETE / UPDATE work, but space reclaim is partial.** Deleted rows in
-  partially-deleted stripes stay on disk until Phase 3 (full stripe compaction).
+- **DELETE / UPDATE work, but space reclaim is partial for partially-deleted stripes.**
+  Deleted rows in partially-deleted stripes stay on disk until `columnar_compact()` is called.
   Fully-deleted stripes are reclaimed by VACUUM. Space occupied by old UPDATE
-  versions is also only reclaimed when the stripe is fully deleted.
+  versions is also only reclaimed when the stripe is compacted or fully deleted.
 - **Stale index entries after UPDATE.** Old-TID index entries remain until index
   VACUUM removes them. They are silently skipped during index scans (bitmap check).
 - **No parallel Seq Scan.** For a `Gather → Parallel Seq Scan` on a single columnar
   table, only the leader process scans the stripes; workers return 0 rows. This means
   single-table parallel scans don't actually parallelise yet.
 - **No TOAST.** `columnar_relation_needs_toast_table` returns false.
-- **No ANALYZE.** `columnar_scan_analyze_next_block` always returns false (stub).
 - **No tablespace support.** `columnar_relation_copy_data` raises an error.
 - **Storage size not visible via `pg_total_relation_size`.** Stripe files live outside
   PostgreSQL's normal heap storage, so standard size functions report 0 bytes.
   Use `columnar_storage_size()` internally, or inspect the directory directly:
   `ls -lh $PGDATA/columnar/<dbOid>/<relfilenode>/`.
 - **pg_class.relpages is stale.** Statistics are estimated from stripe metadata in
-  `columnar_relation_estimate_size`; ANALYZE is a no-op, so the planner uses estimates.
+  `columnar_relation_estimate_size`; planner estimates may differ from actual row counts
+  until ANALYZE is run explicitly.
 
 ---
 

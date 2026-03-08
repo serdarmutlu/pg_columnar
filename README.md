@@ -171,11 +171,49 @@ Space reclaim behaviour:
 | Situation | After VACUUM |
 |---|---|
 | All rows in a stripe deleted | Stripe file removed from disk; full space reclaimed |
-| Some rows in a stripe deleted | Stripe file kept (TIDs must not shift); space reclaimed in Phase 3 |
-| Rows updated | Same as partially-deleted until Phase 3 |
+| Some rows in a stripe deleted | Stripe file kept (TIDs must not shift); space reclaimed by `columnar_compact()` |
+| Rows updated | Same as partially-deleted; space reclaimed by `columnar_compact()` |
 
 After VACUUM, `SELECT COUNT(*)` and planner estimates reflect only live rows.
 Autovacuum runs `VACUUM` automatically in the background.
+
+### Compaction
+
+`columnar_compact()` reclaims space from partially-deleted stripes by rewriting them
+without the deleted rows:
+
+```sql
+-- Compact a table (rewrites partially-deleted stripes)
+SELECT * FROM columnar_compact('measurements');
+-- Returns: (stripes_compacted, rows_compacted)
+```
+
+Typical workflow — run VACUUM first to remove fully-deleted stripes, then compact to
+reclaim space from partially-deleted ones:
+
+```sql
+VACUUM measurements;
+SELECT * FROM columnar_compact('measurements');
+```
+
+Compaction re-inserts surviving rows through the write buffer, producing a new compact
+stripe at the end of the table. Indexes are rebuilt automatically for the new rows.
+Old TIDs pointing into the original stripe are invalidated (index lookups return no row);
+the new rows receive fresh TIDs with new index entries.
+
+### ANALYZE
+
+`ANALYZE` is fully supported and populates column statistics used by the query planner:
+
+```sql
+ANALYZE measurements;
+```
+
+After `ANALYZE`:
+- `pg_class.reltuples` is set to the exact live row count
+- `pg_statistic` is populated with per-column statistics (`n_distinct`, most-common
+  values, histograms) that the planner uses for cardinality estimation
+- Autovacuum runs `ANALYZE` automatically alongside `VACUUM`
 
 ### Drop or truncate
 
@@ -317,9 +355,8 @@ replays the IPC bytes from memory rather than reopening stripe files:
 - **No parallel scan** -- parallel sequential scans on a single columnar table are
   not parallelised (workers return 0 rows; only the leader scans)
 - **Partial space reclaim after DELETE/UPDATE** -- deleted rows inside a partially-deleted
-  stripe occupy disk space until Phase 3 compaction; only fully-deleted stripes are
-  reclaimed by VACUUM
-- **No ANALYZE** -- `ANALYZE` is a no-op; the planner uses estimates from stripe metadata
+  stripe occupy disk space until `columnar_compact()` is called; only fully-deleted
+  stripes are reclaimed automatically by VACUUM
 
 ## License
 
