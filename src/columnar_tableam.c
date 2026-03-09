@@ -3414,6 +3414,567 @@ columnar_compact(PG_FUNCTION_ARGS)
 }
 
 /* ----------------------------------------------------------------
+ * columnar_rebuild_metadata(regclass) — disaster-recovery metadata
+ * reconstruction
+ *
+ * Scans the stripe directory for stripe_XXXXXX.arrow files, reads each
+ * stripe to recover (stripe_id, row_count, file_size, compression,
+ * uncompressed_size), counts deleted rows from .deleted bitmaps, then
+ * writes a fresh metadata file.
+ *
+ * Primary use case: metadata file is lost or corrupted.  The function is
+ * also safe to run on a healthy table — the recovered metadata will be
+ * equivalent to the original.
+ *
+ * Algorithm:
+ *   Phase 1  Scan directory, collect stripe IDs from .arrow files.
+ *   Phase 2  For each stripe:
+ *              - stat() → file_size
+ *              - Read first 4 bytes to detect compression
+ *                (ZSTD: 0x28B52FFD, LZ4: 0x04224D18, else uncompressed)
+ *              - Get uncompressed_size from frame header
+ *                (ZSTD: ZSTD_getFrameContentSize,
+ *                 LZ4:  LZ4F_getFrameInfo → frameInfo.contentSize,
+ *                 NONE: equal to file_size)
+ *              - Read Arrow IPC stream → batch.length = row_count
+ *              - Read .deleted bitmap → count set bits = deleted_count
+ *              - Build StripeMetadata entry
+ *   Phase 3  Compute total_rows = Σ(row_count_i − deleted_count_i)
+ *            and write the new metadata file via columnar_write_metadata.
+ *
+ * Stripe files that cannot be read are skipped with a WARNING; the rest
+ * are still recovered.
+ *
+ * Lock: ExclusiveLock for the duration — prevents concurrent reads/writes.
+ * ----------------------------------------------------------------
+ */
+
+static int
+stripe_id_cmp(const void *a, const void *b)
+{
+	return *(const int *) a - *(const int *) b;
+}
+
+PG_FUNCTION_INFO_V1(columnar_rebuild_metadata);
+
+/*
+ * columnar_rebuild_metadata(regclass)
+ *   -> record(stripes_rebuilt int, rows_total bigint)
+ */
+Datum
+columnar_rebuild_metadata(PG_FUNCTION_ARGS)
+{
+	Oid			relOid = PG_GETARG_OID(0);
+	Relation	rel;
+	const RelFileLocator *locator;
+	char	   *dirpath;
+	DIR		   *dir;
+	struct dirent *de;
+
+	/* Stripe IDs collected from the directory scan */
+	int		   *stripe_ids;
+	int			nstripes = 0;
+	int			stripes_alloc = 64;
+
+	/* Output metadata being built */
+	StripeMetadata *out_stripes;
+	int			n_out = 0;		/* stripes successfully recovered */
+	int64_t		rows_total = 0;
+
+	ColumnarMetadata new_meta;
+	TupleDesc	tupdesc;
+	Datum		values[2];
+	bool		isnull[2] = {false, false};
+
+	rel = table_open(relOid, ExclusiveLock);
+
+	if (rel->rd_rel->relam != get_columnar_am_oid())
+	{
+		table_close(rel, ExclusiveLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("relation \"%s\" is not a columnar table",
+						RelationGetRelationName(rel))));
+	}
+
+	locator = RelationGetLocator(rel);
+
+	/*
+	 * Flush any in-progress write buffer first so its rows become a proper
+	 * on-disk stripe and are included in the rebuild.
+	 */
+	{
+		ColumnarWriteBuffer *existing = columnar_find_write_buffer(rel);
+
+		if (existing != NULL && existing->nrows > 0)
+			columnar_flush_write_buffer(existing);
+	}
+
+	/* Serialise against concurrent INSERTs, DELETEs, and VACUUM */
+	columnar_acquire_write_lock(locator);
+
+	/* ----------------------------------------------------------------
+	 * Phase 1: scan directory, collect stripe IDs from .arrow files.
+	 * ----------------------------------------------------------------
+	 */
+	dirpath = columnar_dir_path(locator);
+	dir = opendir(dirpath);
+	if (dir == NULL)
+	{
+		pfree(dirpath);
+		table_close(rel, ExclusiveLock);
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open columnar storage directory \"%s\": %m",
+						dirpath)));
+	}
+
+	stripe_ids = palloc(sizeof(int) * stripes_alloc);
+
+	while ((de = readdir(dir)) != NULL)
+	{
+		int			sid;
+		size_t		namelen;
+
+		/*
+		 * Match files named "stripe_<N>.arrow" exactly.
+		 *
+		 * sscanf(name, "stripe_%d.arrow", &sid) is NOT sufficient: it returns
+		 * 1 for "stripe_000001.deleted" because %d matches "000001" and sscanf
+		 * stops after the first format/input mismatch without failing.  We
+		 * therefore verify the ".arrow" suffix via strcmp before trusting the
+		 * sscanf result.
+		 */
+		namelen = strlen(de->d_name);
+		if (namelen < 7 || strcmp(de->d_name + namelen - 6, ".arrow") != 0)
+			continue;			/* not a .arrow file */
+		if (sscanf(de->d_name, "stripe_%d.arrow", &sid) != 1)
+			continue;			/* not a stripe .arrow file */
+
+		if (nstripes >= stripes_alloc)
+		{
+			stripes_alloc *= 2;
+			stripe_ids = repalloc(stripe_ids, sizeof(int) * stripes_alloc);
+		}
+		stripe_ids[nstripes++] = sid;
+	}
+	closedir(dir);
+	pfree(dirpath);
+
+	/* Sort numerically — readdir order is filesystem-defined */
+	if (nstripes > 1)
+		qsort(stripe_ids, nstripes, sizeof(int), stripe_id_cmp);
+
+	/* ----------------------------------------------------------------
+	 * Phase 2: inspect each stripe file and recover metadata.
+	 * ----------------------------------------------------------------
+	 */
+	out_stripes = nstripes > 0
+		? palloc0(sizeof(StripeMetadata) * nstripes)
+		: NULL;
+
+	for (int si = 0; si < nstripes; si++)
+	{
+		int			stripe_id = stripe_ids[si];
+		char	   *filepath;
+		struct stat st;
+		int64_t		file_size;
+		void	   *file_data;
+		FILE	   *fp;
+		int			compression;
+		int64_t		uncompressed_size = 0;
+		int64_t		row_count = 0;
+		int64_t		deleted_count = 0;
+
+		CHECK_FOR_INTERRUPTS();
+
+		/* --- stat the file to get its size --- */
+		filepath = columnar_stripe_path(locator, stripe_id);
+		if (stat(filepath, &st) != 0)
+		{
+			pfree(filepath);
+			ereport(WARNING,
+					(errmsg("columnar_rebuild_metadata: cannot stat stripe %d "
+							"file, skipping", stripe_id)));
+			continue;
+		}
+		file_size = st.st_size;
+
+		if (file_size < 4)
+		{
+			pfree(filepath);
+			ereport(WARNING,
+					(errmsg("columnar_rebuild_metadata: stripe %d file is too "
+							"small (%lld bytes), skipping",
+							stripe_id, (long long) file_size)));
+			continue;
+		}
+
+		/* --- read the entire file into memory --- */
+		fp = fopen(filepath, "rb");
+		if (fp == NULL)
+		{
+			pfree(filepath);
+			ereport(WARNING,
+					(errmsg("columnar_rebuild_metadata: cannot open stripe %d "
+							"file, skipping", stripe_id)));
+			continue;
+		}
+		pfree(filepath);
+
+		file_data = palloc(file_size);
+		if (fread(file_data, 1, file_size, fp) != (size_t) file_size)
+		{
+			fclose(fp);
+			pfree(file_data);
+			ereport(WARNING,
+					(errmsg("columnar_rebuild_metadata: cannot read stripe %d "
+							"file, skipping", stripe_id)));
+			continue;
+		}
+		fclose(fp);
+
+		/* --- detect compression from magic bytes --- */
+		{
+			const uint8_t *hdr = (const uint8_t *) file_data;
+
+			if (hdr[0] == 0x28 && hdr[1] == 0xB5 &&
+				hdr[2] == 0x2F && hdr[3] == 0xFD)
+				compression = COLUMNAR_COMPRESSION_ZSTD;
+			else if (hdr[0] == 0x04 && hdr[1] == 0x22 &&
+					 hdr[2] == 0x4D && hdr[3] == 0x18)
+				compression = COLUMNAR_COMPRESSION_LZ4;
+			else
+				compression = COLUMNAR_COMPRESSION_NONE;
+		}
+
+		/* ----------------------------------------------------------------
+		 * Decompress (if needed) and read the Arrow IPC stream to get
+		 * the row count.  The decompressed bytes are transferred into an
+		 * ArrowBuffer which is then handed to ArrowIpcInputStreamInitBuffer.
+		 * ----------------------------------------------------------------
+		 */
+		{
+			struct ArrowBuffer		   ipc_buf;
+			struct ArrowIpcInputStream ipc_stream;
+			struct ArrowArrayStream	   arrow_stream;
+			struct ArrowSchema		   arrow_schema;
+			struct ArrowArray		   arrow_batch;
+			int						   rc;
+			bool					   ipc_stream_ready = false;
+			bool					   arrow_stream_ready = false;
+			bool					   schema_ready = false;
+
+			ArrowBufferInit(&ipc_buf);
+
+			/* --- decompress into ipc_buf; pfree(file_data) in all paths --- */
+			if (compression == COLUMNAR_COMPRESSION_ZSTD)
+			{
+#ifdef HAVE_LIBZSTD
+				unsigned long long uc_size;
+				size_t			   result;
+
+				uc_size = ZSTD_getFrameContentSize(file_data, file_size);
+				if (uc_size == ZSTD_CONTENTSIZE_UNKNOWN ||
+					uc_size == ZSTD_CONTENTSIZE_ERROR)
+				{
+					pfree(file_data);
+					ereport(WARNING,
+							(errmsg("columnar_rebuild_metadata: cannot determine "
+									"ZSTD uncompressed size for stripe %d, "
+									"skipping", stripe_id)));
+					continue;
+				}
+				uncompressed_size = (int64_t) uc_size;
+
+				if (ArrowBufferReserve(&ipc_buf, uncompressed_size) != NANOARROW_OK)
+				{
+					pfree(file_data);
+					ereport(WARNING,
+							(errmsg("columnar_rebuild_metadata: out of memory "
+									"decompressing stripe %d, skipping",
+									stripe_id)));
+					continue;
+				}
+
+				result = ZSTD_decompress(ipc_buf.data, (size_t) uncompressed_size,
+										 file_data, (size_t) file_size);
+				pfree(file_data);
+
+				if (ZSTD_isError(result))
+				{
+					ArrowBufferReset(&ipc_buf);
+					ereport(WARNING,
+							(errmsg("columnar_rebuild_metadata: ZSTD decompression "
+									"failed for stripe %d (%s), skipping",
+									stripe_id, ZSTD_getErrorName(result))));
+					continue;
+				}
+				ipc_buf.size_bytes = (int64_t) result;
+#else
+				pfree(file_data);
+				ereport(WARNING,
+						(errmsg("columnar_rebuild_metadata: ZSTD support not "
+								"compiled in; cannot recover stripe %d, skipping",
+								stripe_id)));
+				continue;
+#endif
+			}
+			else if (compression == COLUMNAR_COMPRESSION_LZ4)
+			{
+#ifdef HAVE_LIBLZ4
+				LZ4F_dctx		 *dctx = NULL;
+				LZ4F_frameInfo_t  fi;
+				LZ4F_errorCode_t  err;
+				size_t			  consumed;
+				size_t			  src_size;
+				size_t			  dst_size;
+				size_t			  ret;
+
+				/*
+				 * First pass: extract the frame header to get the uncompressed
+				 * content size.  We set contentSize when writing (see
+				 * columnar_write_stripe) so this should always succeed.
+				 */
+				err = LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION);
+				if (LZ4F_isError(err))
+				{
+					pfree(file_data);
+					ereport(WARNING,
+							(errmsg("columnar_rebuild_metadata: failed to create "
+									"LZ4 context for stripe %d, skipping",
+									stripe_id)));
+					continue;
+				}
+
+				consumed = (size_t) file_size;
+				memset(&fi, 0, sizeof(fi));
+				err = (LZ4F_errorCode_t) LZ4F_getFrameInfo(dctx, &fi,
+															file_data, &consumed);
+				LZ4F_freeDecompressionContext(dctx);
+				dctx = NULL;
+
+				if (LZ4F_isError(err))
+				{
+					pfree(file_data);
+					ereport(WARNING,
+							(errmsg("columnar_rebuild_metadata: LZ4F_getFrameInfo "
+									"failed for stripe %d (%s), skipping",
+									stripe_id, LZ4F_getErrorName(err))));
+					continue;
+				}
+				if (fi.contentSize == 0)
+				{
+					pfree(file_data);
+					ereport(WARNING,
+							(errmsg("columnar_rebuild_metadata: LZ4 frame for "
+									"stripe %d has no stored content size, "
+									"skipping", stripe_id)));
+					continue;
+				}
+				uncompressed_size = (int64_t) fi.contentSize;
+
+				/*
+				 * Second pass: full decompression using a fresh context.
+				 * LZ4F_decompress handles the complete frame (including the
+				 * header that getFrameInfo already consumed in the first pass)
+				 * because this dctx is brand new.
+				 */
+				err = LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION);
+				if (LZ4F_isError(err))
+				{
+					pfree(file_data);
+					ereport(WARNING,
+							(errmsg("columnar_rebuild_metadata: failed to create "
+									"LZ4 context (pass 2) for stripe %d, "
+									"skipping", stripe_id)));
+					continue;
+				}
+
+				if (ArrowBufferReserve(&ipc_buf, uncompressed_size) != NANOARROW_OK)
+				{
+					LZ4F_freeDecompressionContext(dctx);
+					pfree(file_data);
+					ereport(WARNING,
+							(errmsg("columnar_rebuild_metadata: out of memory "
+									"decompressing stripe %d, skipping",
+									stripe_id)));
+					continue;
+				}
+
+				src_size = (size_t) file_size;
+				dst_size = (size_t) uncompressed_size;
+				ret = LZ4F_decompress(dctx,
+									  ipc_buf.data, &dst_size,
+									  file_data, &src_size,
+									  NULL);
+				LZ4F_freeDecompressionContext(dctx);
+				pfree(file_data);
+
+				if (LZ4F_isError(ret))
+				{
+					ArrowBufferReset(&ipc_buf);
+					ereport(WARNING,
+							(errmsg("columnar_rebuild_metadata: LZ4 decompression "
+									"failed for stripe %d (%s), skipping",
+									stripe_id, LZ4F_getErrorName(ret))));
+					continue;
+				}
+				ipc_buf.size_bytes = (int64_t) dst_size;
+#else
+				pfree(file_data);
+				ereport(WARNING,
+						(errmsg("columnar_rebuild_metadata: LZ4 support not "
+								"compiled in; cannot recover stripe %d, skipping",
+								stripe_id)));
+				continue;
+#endif
+			}
+			else
+			{
+				/* Uncompressed: copy raw bytes into the ArrowBuffer */
+				uncompressed_size = file_size;
+
+				if (ArrowBufferReserve(&ipc_buf, file_size) != NANOARROW_OK)
+				{
+					pfree(file_data);
+					ereport(WARNING,
+							(errmsg("columnar_rebuild_metadata: out of memory "
+									"reading stripe %d, skipping", stripe_id)));
+					continue;
+				}
+				memcpy(ipc_buf.data, file_data, file_size);
+				ipc_buf.size_bytes = file_size;
+				pfree(file_data);
+			}
+
+			/*
+			 * file_data is now freed; ipc_buf holds the decompressed
+			 * (or raw) IPC stream bytes.
+			 *
+			 * Hand ipc_buf to the Arrow IPC input stream.
+			 * ArrowIpcInputStreamInitBuffer takes ownership of the buffer;
+			 * do NOT ArrowBufferReset(&ipc_buf) after this succeeds.
+			 */
+			rc = ArrowIpcInputStreamInitBuffer(&ipc_stream, &ipc_buf);
+			if (rc != NANOARROW_OK)
+			{
+				ArrowBufferReset(&ipc_buf);	/* not yet owned by stream */
+				ereport(WARNING,
+						(errmsg("columnar_rebuild_metadata: failed to init IPC "
+								"input stream for stripe %d, skipping",
+								stripe_id)));
+				continue;
+			}
+			ipc_stream_ready = true;
+
+			/* ArrowIpcArrayStreamReaderInit takes ownership of ipc_stream */
+			rc = ArrowIpcArrayStreamReaderInit(&arrow_stream, &ipc_stream, NULL);
+			if (rc != NANOARROW_OK)
+			{
+				ipc_stream.release(&ipc_stream);
+				ereport(WARNING,
+						(errmsg("columnar_rebuild_metadata: failed to init IPC "
+								"reader for stripe %d, skipping", stripe_id)));
+				continue;
+			}
+			ipc_stream_ready = false; /* now owned by arrow_stream */
+			arrow_stream_ready = true;
+
+			rc = arrow_stream.get_schema(&arrow_stream, &arrow_schema);
+			if (rc != 0)
+			{
+				arrow_stream.release(&arrow_stream);
+				ereport(WARNING,
+						(errmsg("columnar_rebuild_metadata: failed to read "
+								"schema from stripe %d, skipping", stripe_id)));
+				continue;
+			}
+			schema_ready = true;
+
+			rc = arrow_stream.get_next(&arrow_stream, &arrow_batch);
+			if (rc != NANOARROW_OK)
+			{
+				arrow_schema.release(&arrow_schema);
+				arrow_stream.release(&arrow_stream);
+				ereport(WARNING,
+						(errmsg("columnar_rebuild_metadata: failed to read "
+								"batch from stripe %d, skipping", stripe_id)));
+				continue;
+			}
+
+			row_count = arrow_batch.length;
+
+			arrow_batch.release(&arrow_batch);
+			arrow_schema.release(&arrow_schema);
+			arrow_stream.release(&arrow_stream);
+
+			(void) ipc_stream_ready;	/* suppress unused-variable warnings */
+			(void) arrow_stream_ready;
+			(void) schema_ready;
+		}
+
+		/* --- count deleted rows from the .deleted bitmap --- */
+		if (row_count > 0)
+		{
+			uint8_t    *bitmap = columnar_read_delete_bitmap(locator,
+															  stripe_id,
+															  row_count);
+
+			if (bitmap != NULL)
+			{
+				int64_t		nbytes = (row_count + 7) / 8;
+				int64_t		b;
+
+				for (b = 0; b < nbytes; b++)
+					deleted_count += __builtin_popcount(bitmap[b]);
+				pfree(bitmap);
+			}
+		}
+
+		/* --- record this stripe in the output array --- */
+		out_stripes[n_out].stripe_id		  = stripe_id;
+		out_stripes[n_out].row_count		  = row_count;
+		out_stripes[n_out].file_size		  = file_size;
+		out_stripes[n_out].compression		  = compression;
+		out_stripes[n_out].uncompressed_size  = uncompressed_size;
+		rows_total += (row_count - deleted_count);
+		n_out++;
+	}
+
+	pfree(stripe_ids);
+
+	/* ----------------------------------------------------------------
+	 * Phase 3: write the reconstructed metadata.
+	 *
+	 * columnar_write_metadata updates the backend-local metadata cache
+	 * as a side effect, so no extra cache eviction is needed.
+	 * ----------------------------------------------------------------
+	 */
+	new_meta.num_stripes = n_out;
+	new_meta.total_rows	 = rows_total;
+	new_meta.stripes	 = out_stripes;
+
+	columnar_write_metadata(locator, &new_meta);
+
+	if (out_stripes)
+		pfree(out_stripes);
+
+	table_close(rel, ExclusiveLock);
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("columnar_rebuild_metadata must be called as a "
+						"set-returning function")));
+
+	values[0] = Int32GetDatum(n_out);
+	values[1] = Int64GetDatum(rows_total);
+	tupdesc = BlessTupleDesc(tupdesc);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, isnull)));
+}
+
+/* ----------------------------------------------------------------
  * SQL-callable diagnostic functions
  * ----------------------------------------------------------------
  */

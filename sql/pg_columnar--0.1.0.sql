@@ -75,3 +75,25 @@ COMMENT ON FUNCTION columnar_cache_stats() IS
 'Returns cumulative cache hit/miss counters for all four columnar caching
 layers (metadata, stats, delete-bitmap, stripe IPC bytes) in the current
 backend, plus the number of bytes currently resident in the IPC bytes cache.';
+
+CREATE FUNCTION columnar_rebuild_metadata(
+    relation            regclass,
+    OUT stripes_rebuilt int,
+    OUT rows_total      bigint
+)
+RETURNS record
+AS 'MODULE_PATHNAME', 'columnar_rebuild_metadata'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION columnar_rebuild_metadata(regclass) IS
+'Disaster-recovery function: reconstructs the metadata file by scanning the
+stripe directory for .arrow files and reading each stripe''s Arrow IPC stream.
+
+Useful when the metadata file has been lost or corrupted.  Safe to run on a
+healthy table — the recovered metadata is equivalent to the original.
+
+Stripes that cannot be read are skipped with a WARNING; the rest are still
+recovered.  Returns the number of stripes recovered and the total live row
+count (row_count minus deleted rows) across all recovered stripes.
+
+Acquires ExclusiveLock for the duration — no concurrent access.';

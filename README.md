@@ -158,6 +158,14 @@ UPDATE is implemented as a delete of the old row plus an insert of the new row.
 Stale index entries for updated rows are transparently skipped during index scans
 and are cleaned up by `VACUUM`.
 
+### Concurrent write safety
+
+Multiple sessions can safely `INSERT`, `DELETE`, and `UPDATE` the same columnar table
+simultaneously. Concurrent writes are serialised using a per-relation advisory lock
+that is held for the duration of each metadata-modifying operation (stripe flush,
+delete-bitmap update, VACUUM). The lock does not conflict with read-only queries —
+`SELECT` and index scans are never blocked while a write is in progress.
+
 ### VACUUM
 
 `VACUUM` reclaims disk space from deleted rows:
@@ -200,6 +208,35 @@ Compaction re-inserts surviving rows through the write buffer, producing a new c
 stripe at the end of the table. Indexes are rebuilt automatically for the new rows.
 Old TIDs pointing into the original stripe are invalidated (index lookups return no row);
 the new rows receive fresh TIDs with new index entries.
+
+### Metadata reconstruction
+
+If the `metadata` file is lost or corrupted, `columnar_rebuild_metadata()` recovers it
+by scanning the stripe directory and reading each `.arrow` file:
+
+```sql
+SELECT * FROM columnar_rebuild_metadata('measurements');
+-- Returns: (stripes_rebuilt, rows_total)
+```
+
+The function detects each stripe's compression format from the file header magic bytes,
+decompresses it, reads the Arrow IPC stream to recover the row count, and consults the
+`.deleted` bitmap files to compute the live row count. It then writes a fresh `metadata`
+file and returns the number of stripes recovered and the total live row count.
+
+Stripe files that cannot be read are skipped with a `WARNING`; the remaining stripes
+are still recovered. The function is also safe to run on a healthy table — the
+reconstructed metadata is equivalent to the original.
+
+Typical use:
+
+```sql
+-- After a metadata file is lost
+SELECT * FROM columnar_rebuild_metadata('measurements');
+
+-- Optionally run ANALYZE afterwards so the planner has accurate statistics
+ANALYZE measurements;
+```
 
 ### ANALYZE
 
@@ -347,25 +384,38 @@ replays the IPC bytes from memory rather than reopening stripe files:
 | `lz4`    | ~1.5–2× |
 | `zstd`   | ~2× |
 
-### Parallel sequential scan
+### Parallel scans
 
-`Gather → Parallel Seq Scan` is fully supported. Workers divide stripes among
-themselves using an atomic counter stored in shared memory:
+**Parallel Seq Scan** (`Gather → Parallel Seq Scan`) is fully supported. Workers divide
+stripes among themselves using a lock-free atomic counter stored in shared memory:
 
 ```sql
 SET max_parallel_workers_per_gather = 4;
 EXPLAIN (ANALYZE, COSTS OFF) SELECT count(*) FROM measurements;
--- Parallel Seq Scan on measurements (actual ... rows=200000 loops=5)
---   Worker 0: actual rows=190000
---   Worker 1: actual rows=190000
---   ...
+-- Gather (actual rows=1000000)
+--   Workers Planned: 4
+--   -> Parallel Seq Scan on measurements (actual rows=200000 loops=5)
 ```
 
-Stripe assignment is lock-free: each worker atomically increments a shared counter
-to claim the next stripe. Workers skip zero-row stripes (fully vacuumed) and
-pruned stripes without needing coordination. For tables with fewer stripes than
-workers, the leader may finish all stripes before workers start — the result is
-still correct and accurate.
+Each worker atomically increments a shared counter to claim the next unprocessed stripe.
+Workers skip zero-row stripes (fully vacuumed) and pruned stripes without needing
+coordination. For tables with fewer stripes than workers, any remaining workers simply
+find no stripes left and return zero rows — the aggregate result is still correct.
+
+**Parallel Append** (used by `UNION ALL` queries and partitioned tables) is also fully
+supported. Each worker is assigned a distinct sub-table by the executor and scans it
+independently — no stripe sharing or coordination is needed:
+
+```sql
+-- All four tables are scanned in parallel; each worker owns its assigned table
+SELECT 'heap'     AS t, count(*) FROM measurements_heap
+UNION ALL
+SELECT 'columnar' AS t, count(*) FROM measurements_columnar
+UNION ALL
+SELECT 'lz4'      AS t, count(*) FROM measurements_columnar_lz4
+UNION ALL
+SELECT 'zstd'     AS t, count(*) FROM measurements_columnar_zstd;
+```
 
 ## Current Limitations
 
