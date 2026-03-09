@@ -563,6 +563,64 @@ After `ANALYZE orders_columnar`:
 
 ---
 
+## Parallel Sequential Scan
+
+`Gather → Parallel Seq Scan` is fully implemented. Workers divide stripes among
+themselves using an atomic counter stored in a shared-memory (DSM) segment.
+
+### Shared state
+
+```c
+typedef struct ColumnarParallelScanDescData
+{
+    ParallelTableScanDescData base;          /* phs_relid, phs_syncscan */
+    pg_atomic_uint32          phs_cstripeno; /* next stripe index to claim (0-based) */
+} ColumnarParallelScanDescData;
+```
+
+### DSM lifecycle
+
+- **`columnar_parallelscan_estimate`**: returns `sizeof(ColumnarParallelScanDescData)`.
+- **`columnar_parallelscan_initialize`**: called by the leader on the DSM-backed pscan;
+  sets `phs_cstripeno = 0`.
+- **`columnar_parallelscan_reinitialize`**: resets `phs_cstripeno = 0` for rescans.
+
+### Stripe claiming
+
+In `columnar_scan_getnextslot`, when `sscan->rs_parallel != NULL` (coordinated
+Parallel Seq Scan), each worker atomically claims the next stripe:
+
+```c
+uint32 claimed = pg_atomic_fetch_add_u32(&cpscan->phs_cstripeno, 1);
+next_stripe = (claimed < (uint32) scan->num_stripes) ? (int) claimed : -1;
+```
+
+If `claimed >= num_stripes` the worker is done with on-disk stripes and
+falls through to the write-buffer check (which returns nothing for workers,
+as the write buffer belongs to the leader's backend).
+
+Empty stripes (`row_count == 0`, fully vacuumed) and pruned stripes are skipped
+by `continue`-ing the loop, which triggers a new atomic claim for the next stripe.
+
+### Write buffer
+
+Only the leader process (`!IsParallelWorker()`) includes the write buffer in its
+scan. Workers are separate backends and cannot see the leader's uncommitted rows.
+
+### Parallel Append compatibility
+
+`IsParallelWorker() == true` with `pscan == NULL` means a Parallel Append — each
+worker owns its assigned sub-table entirely. The atomic path is only taken when
+`sscan->rs_parallel != NULL`.
+
+### Behaviour for small tables
+
+For tables with fewer stripes than parallel workers, the leader may claim all
+stripes before workers start. This is expected and correct — the result is still
+accurate, just not faster than a serial scan for that particular table size.
+
+---
+
 ## Bugs Found and Fixed
 
 ### Bug 1 — `ROW_COUNT` psql built-in variable collision
@@ -618,9 +676,10 @@ if (IsParallelWorker() && pscan != NULL)
   versions is also only reclaimed when the stripe is compacted or fully deleted.
 - **Stale index entries after UPDATE.** Old-TID index entries remain until index
   VACUUM removes them. They are silently skipped during index scans (bitmap check).
-- **No parallel Seq Scan.** For a `Gather → Parallel Seq Scan` on a single columnar
-  table, only the leader process scans the stripes; workers return 0 rows. This means
-  single-table parallel scans don't actually parallelise yet.
+- **Parallel Seq Scan is implemented.** Workers compete for stripes via an atomic counter
+  (`phs_cstripeno` in `ColumnarParallelScanDescData`). For very small tables the leader
+  may claim all stripes before workers start — this is correct and expected behavior, not
+  a bug. Real parallel speedup requires tables with many stripes (≫ number of workers).
 - **No TOAST.** `columnar_relation_needs_toast_table` returns false.
 - **No tablespace support.** `columnar_relation_copy_data` raises an error.
 - **Storage size not visible via `pg_total_relation_size`.** Stripe files live outside

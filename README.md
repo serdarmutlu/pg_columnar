@@ -347,13 +347,31 @@ replays the IPC bytes from memory rather than reopening stripe files:
 | `lz4`    | ~1.5–2× |
 | `zstd`   | ~2× |
 
+### Parallel sequential scan
+
+`Gather → Parallel Seq Scan` is fully supported. Workers divide stripes among
+themselves using an atomic counter stored in shared memory:
+
+```sql
+SET max_parallel_workers_per_gather = 4;
+EXPLAIN (ANALYZE, COSTS OFF) SELECT count(*) FROM measurements;
+-- Parallel Seq Scan on measurements (actual ... rows=200000 loops=5)
+--   Worker 0: actual rows=190000
+--   Worker 1: actual rows=190000
+--   ...
+```
+
+Stripe assignment is lock-free: each worker atomically increments a shared counter
+to claim the next stripe. Workers skip zero-row stripes (fully vacuumed) and
+pruned stripes without needing coordination. For tables with fewer stripes than
+workers, the leader may finish all stripes before workers start — the result is
+still correct and accurate.
+
 ## Current Limitations
 
 - **No MVCC** -- no snapshot isolation; all rows are always visible to all sessions
 - **No WAL logging** -- crash safety is limited to fsync; stripe files and bitmaps
   are written outside PostgreSQL's WAL infrastructure
-- **No parallel scan** -- parallel sequential scans on a single columnar table are
-  not parallelised (workers return 0 rows; only the leader scans)
 - **Partial space reclaim after DELETE/UPDATE** -- deleted rows inside a partially-deleted
   stripe occupy disk space until `columnar_compact()` is called; only fully-deleted
   stripes are reclaimed automatically by VACUUM

@@ -11,6 +11,7 @@
 #include "executor/tuptable.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "port/atomics.h"
 #include "storage/bufmgr.h"
 #include "storage/procnumber.h"
 #include "storage/read_stream.h"
@@ -100,6 +101,22 @@ typedef struct ColumnarScanDescData
 } ColumnarScanDescData;
 
 typedef ColumnarScanDescData *ColumnarScanDesc;
+
+/*
+ * Shared-memory descriptor for a coordinated Parallel Sequential Scan.
+ *
+ * The base ParallelTableScanDescData (phs_relid, phs_syncscan) is inherited.
+ * phs_cstripeno is an atomic counter: each parallel worker atomically
+ * increments it to claim the next 0-based stripe index to scan.  When the
+ * claimed value exceeds num_stripes the worker is done with on-disk stripes.
+ */
+typedef struct ColumnarParallelScanDescData
+{
+    ParallelTableScanDescData base;         /* must be first */
+    pg_atomic_uint32          phs_cstripeno; /* next stripe index to claim */
+} ColumnarParallelScanDescData;
+
+typedef ColumnarParallelScanDescData *ColumnarParallelScanDesc;
 
 /* ----------------------------------------------------------------
  * Index fetch descriptor for columnar tables.
@@ -776,35 +793,38 @@ columnar_scan_begin(Relation rel, Snapshot snapshot,
 	scan->wb_row_index = 0;
 
 	/*
-	 * For a coordinated Parallel Sequential Scan (pscan != NULL), only
-	 * the leader should scan stripes; workers return no rows to prevent
-	 * duplicate results, because the leader will cover the full table.
+	 * All processes (leader and workers) receive the full stripe list.
+	 * In a coordinated Parallel Seq Scan (pscan != NULL), stripe assignment
+	 * is coordinated via the atomic counter in ColumnarParallelScanDescData;
+	 * each process claims stripes one at a time in columnar_scan_getnextslot.
 	 *
-	 * For a Parallel Append query (pscan == NULL even when
-	 * IsParallelWorker() is true), each sub-plan is assigned to exactly
-	 * one process with no overlap, so parallel workers must scan their
-	 * assigned table normally.
+	 * In a Parallel Append query (pscan == NULL even when IsParallelWorker()
+	 * is true), each sub-plan is owned by exactly one process with no overlap,
+	 * so workers scan their assigned table serially, same as the leader.
+	 *
+	 * The write buffer (unflushed rows from the current transaction) is only
+	 * scanned by the leader/main process: workers run in separate backends and
+	 * cannot see another backend's write buffer.
 	 */
-	if (IsParallelWorker() && pscan != NULL)
+	scan->num_stripes = meta->num_stripes;
+	if (meta->num_stripes > 0)
 	{
-		scan->num_stripes = 0;
-		scan->stripe_meta = NULL;
-		scan->include_write_buffer = false;
+		/* Take ownership of the stripes array */
+		scan->stripe_meta = meta->stripes;
+		meta->stripes = NULL;
 	}
 	else
-	{
-		scan->num_stripes = meta->num_stripes;
-		if (meta->num_stripes > 0)
-		{
-			/* Take ownership of the stripes array */
-			scan->stripe_meta = meta->stripes;
-			meta->stripes = NULL;
-		}
-		else
-			scan->stripe_meta = NULL;
-		scan->include_write_buffer =
-			(columnar_find_write_buffer(rel) != NULL);
-	}
+		scan->stripe_meta = NULL;
+
+	/*
+	 * Include the write buffer only if we are not a parallel worker.
+	 * Workers in a Parallel Seq Scan are separate backends; they have no
+	 * access to the leader's write buffer.  In a Parallel Append each
+	 * worker owns its sub-table, but for the same reason cannot see the
+	 * leader's uncommitted rows.
+	 */
+	scan->include_write_buffer =
+		(!IsParallelWorker()) && (columnar_find_write_buffer(rel) != NULL);
 
 	if (meta->stripes)
 		pfree(meta->stripes);
@@ -838,11 +858,19 @@ columnar_scan_rescan(TableScanDesc sscan, struct ScanKeyData *key,
 
 	columnar_close_stripe(scan);
 
+	/*
+	 * Reset local per-backend scan state.  In a coordinated Parallel Seq
+	 * Scan, the shared atomic counter is reset by
+	 * columnar_parallelscan_reinitialize(); here we only reset the local
+	 * fields (current_stripe is used only for TID encoding — it is
+	 * overwritten before each stripe is opened).
+	 */
 	scan->current_stripe = 0;
 	scan->has_batch = false;
 	scan->stream_open = false;
 	scan->wb_row_index = 0;
 	scan->include_write_buffer =
+		(!IsParallelWorker()) &&
 		(columnar_find_write_buffer(sscan->rs_rd) != NULL);
 
 	if (key != NULL)
@@ -934,19 +962,45 @@ columnar_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
 		}
 
 		/* Try to open the next stripe */
-		if (scan->current_stripe < scan->num_stripes)
 		{
-			StripeMetadata *sm = &scan->stripe_meta[scan->current_stripe];
+			StripeMetadata *sm;
+			int				next_stripe;
+
+			/*
+			 * In a coordinated Parallel Seq Scan, workers claim stripe
+			 * indexes atomically.  In serial mode (or Parallel Append),
+			 * each process advances its own local counter.
+			 */
+			if (sscan->rs_parallel != NULL)
+			{
+				ColumnarParallelScanDesc cpscan =
+					(ColumnarParallelScanDesc) sscan->rs_parallel;
+				uint32		claimed =
+					pg_atomic_fetch_add_u32(&cpscan->phs_cstripeno, 1);
+
+				next_stripe = (claimed < (uint32) scan->num_stripes)
+					? (int) claimed : -1;
+			}
+			else
+			{
+				next_stripe = (scan->current_stripe < scan->num_stripes)
+					? scan->current_stripe++ : -1;
+			}
+
+			if (next_stripe < 0)
+				goto try_write_buffer; /* all stripes claimed; check WB */
+
+			sm = &scan->stripe_meta[next_stripe];
 
 			/*
 			 * Skip stripes that were fully vacuumed (row_count == 0).
 			 * Their files have been removed; there is nothing to read.
+			 * In parallel mode the next pg_atomic_fetch_add will claim
+			 * the following stripe; in serial mode current_stripe was
+			 * already advanced above.
 			 */
 			if (sm->row_count == 0)
-			{
-				scan->current_stripe++;
 				continue;
-			}
 
 			/*
 			 * Min/max stripe pruning: skip stripes whose value ranges
@@ -955,8 +1009,7 @@ columnar_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
 			 * Note: PostgreSQL's seq-scan path passes nkeys = 0 (quals
 			 * are filtered by the executor, not pushed to the TAM), so
 			 * pruning today is a no-op for plain WHERE-clause queries.
-			 * The infrastructure is ready for a Level-4 custom scan node
-			 * that will pass explicit scan keys.
+			 * The custom scan node (Level 4) passes explicit scan keys.
 			 */
 			if (sscan->rs_nkeys > 0 &&
 				columnar_stripe_should_skip(RelationGetLocator(sscan->rs_rd),
@@ -966,14 +1019,19 @@ columnar_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
 											tupdesc))
 			{
 				scan->stripes_skipped++;
-				scan->current_stripe++;
 				continue;
 			}
 
-			columnar_open_stripe(scan, scan->current_stripe);
-			scan->current_stripe++;
+			/*
+			 * Update current_stripe to the 1-based index of the stripe
+			 * we are about to open so that TID encoding in the slot-fill
+			 * path uses the correct block number.
+			 */
+			scan->current_stripe = next_stripe + 1;
+			columnar_open_stripe(scan, next_stripe);
 			continue;
 		}
+		try_write_buffer:
 
 		/* All stripes exhausted, check write buffer */
 		if (scan->include_write_buffer)
@@ -1148,27 +1206,34 @@ columnar_scan_getnextslot_tidrange(TableScanDesc sscan,
 }
 
 /* ----------------------------------------------------------------
- * Parallel scan stubs
+ * Parallel sequential scan
  * ----------------------------------------------------------------
  */
 static Size
 columnar_parallelscan_estimate(Relation rel)
 {
-	return sizeof(ParallelTableScanDescData);
+	return sizeof(ColumnarParallelScanDescData);
 }
 
 static Size
 columnar_parallelscan_initialize(Relation rel, ParallelTableScanDesc pscan)
 {
-	pscan->phs_relid = RelationGetRelid(rel);
-	pscan->phs_syncscan = false;
-	return sizeof(ParallelTableScanDescData);
+	ColumnarParallelScanDesc cpscan = (ColumnarParallelScanDesc) pscan;
+
+	cpscan->base.phs_relid = RelationGetRelid(rel);
+	cpscan->base.phs_syncscan = false;
+	pg_atomic_init_u32(&cpscan->phs_cstripeno, 0);
+
+	return sizeof(ColumnarParallelScanDescData);
 }
 
 static void
 columnar_parallelscan_reinitialize(Relation rel, ParallelTableScanDesc pscan)
 {
-	/* no-op */
+	ColumnarParallelScanDesc cpscan = (ColumnarParallelScanDesc) pscan;
+
+	/* Reset the stripe counter so a rescan starts from stripe 0 */
+	pg_atomic_write_u32(&cpscan->phs_cstripeno, 0);
 }
 
 /* ----------------------------------------------------------------
