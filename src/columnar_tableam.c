@@ -2037,6 +2037,20 @@ columnar_relation_vacuum(Relation rel, struct VacuumParams *params,
 	bool		any_changes = false;
 	int			i;
 
+	/*
+	 * Serialise against concurrent INSERTs and DELETEs.  Without this lock,
+	 * a concurrent INSERT could flush a new stripe and update the metadata
+	 * while we have already read our stale snapshot; we would then overwrite
+	 * the metadata and silently lose the new stripe.
+	 *
+	 * columnar_acquire_write_lock() also evicts the metadata cache so the
+	 * columnar_read_metadata() call below always reads fresh from disk.
+	 *
+	 * The lock is transaction-level and is released when VACUUM's implicit
+	 * transaction commits.
+	 */
+	columnar_acquire_write_lock(locator);
+
 	meta = columnar_read_metadata(locator);
 	if (meta->num_stripes == 0)
 	{

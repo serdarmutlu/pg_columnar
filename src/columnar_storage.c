@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include "miscadmin.h"
+#include "storage/lock.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 
@@ -182,6 +183,48 @@ columnar_metadata_cache_evict(const RelFileLocator *locator)
 	}
 
 	hash_search(metadata_cache, &key, HASH_REMOVE, NULL);
+}
+
+/*
+ * Acquire the per-relation exclusive advisory write lock.
+ *
+ * This serialises all write operations on a given columnar table across
+ * backends: INSERT flushes (columnar_write_stripe), DELETE bitmap updates
+ * (columnar_set_deleted_bit), and VACUUM's metadata read-modify-write all
+ * acquire this lock before touching files or metadata.
+ *
+ * Advisory locks don't conflict with regular table access locks
+ * (AccessShareLock, RowExclusiveLock, etc.), so read-only queries are
+ * never blocked.
+ *
+ * The lock is transaction-level (sessionLock=false): released automatically
+ * at transaction commit or abort.  Re-entrant within the same transaction: a
+ * second LockAcquire for the same tag by the same backend just increments the
+ * local count, which is safe for the auto-flush + commit-flush double-write path.
+ *
+ * After acquiring the lock, the metadata cache is evicted so the next call to
+ * columnar_read_metadata reads fresh from disk and sees any stripes written by
+ * other backends between our last cache population and now.
+ */
+void
+columnar_acquire_write_lock(const RelFileLocator *locator)
+{
+	LOCKTAG		tag;
+
+	SET_LOCKTAG_ADVISORY(tag,
+						 (uint32) PG_LOCATOR_DB(locator),
+						 (uint32) PG_LOCATOR_REL(locator),
+						 (uint32) 0,
+						 (uint16) 1);
+
+	LockAcquire(&tag, ExclusiveLock, false /* sessionLock */, false /* dontWait */);
+
+	/*
+	 * Evict the metadata cache after acquiring the lock.  Any stripe written
+	 * by another backend after our last read but before we took the lock will
+	 * now be visible when we call columnar_read_metadata.
+	 */
+	columnar_metadata_cache_evict(locator);
 }
 
 /* ----------------------------------------------------------------
@@ -1568,7 +1611,17 @@ columnar_write_stripe(const RelFileLocator *locator,
 	int64_t		uncompressed_size;
 	void	   *compressed = NULL;
 
-	/* Get next stripe ID */
+	/*
+	 * Acquire the per-relation write lock before reading metadata.
+	 * This serialises concurrent INSERT flushes: after we hold the lock no
+	 * other backend can compute the same next_stripe_id or overwrite our
+	 * metadata entry.  The lock function also evicts the metadata cache so
+	 * the read below sees any stripes written by other backends since our
+	 * last cache population.  Lock is released at transaction end.
+	 */
+	columnar_acquire_write_lock(locator);
+
+	/* Get next stripe ID (from disk-fresh metadata after the lock) */
 	meta = columnar_read_metadata(locator);
 	new_stripe_id = meta->num_stripes + 1;
 	filepath = columnar_stripe_path(locator, new_stripe_id);
@@ -1844,9 +1897,26 @@ columnar_set_deleted_bit(const RelFileLocator *locator,
 	FILE	   *fp;
 
 	/*
-	 * Obtain the current bitmap — from cache if available, otherwise
-	 * from disk.  This eliminates the "read" half of the read-modify-write
-	 * cycle for every DELETE after the first one on a given stripe.
+	 * Acquire the per-relation write lock before touching the bitmap.
+	 * This serialises concurrent DELETEs on the same stripe: without the
+	 * lock, two backends could each read the same bitmap, set different bits
+	 * independently, and the last writer would silently lose the other's
+	 * deletion.  Lock is released at transaction end.
+	 */
+	columnar_acquire_write_lock(locator);
+
+	/*
+	 * Evict this stripe's bitmap cache entry so we read from disk below
+	 * rather than from this backend's potentially stale cache.  Another
+	 * backend may have set bits in the bitmap file since we last cached it.
+	 * (The metadata cache was already evicted inside columnar_acquire_write_lock.)
+	 */
+	columnar_bitmap_cache_evict_stripe(locator, stripe_id);
+
+	/*
+	 * Obtain the current bitmap from disk (cache was just evicted above)
+	 * or start from all-zeros if the file does not exist yet.
+	 * This is the read half of the read-modify-write cycle.
 	 */
 	{
 		ColumnarBitmapCacheKey ckey;

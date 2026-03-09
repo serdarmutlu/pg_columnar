@@ -621,6 +621,76 @@ accurate, just not faster than a serial scan for that particular table size.
 
 ---
 
+## Multi-session Write Coordination
+
+Concurrent writes to the same columnar table from different backends are serialised
+using a **per-relation advisory lock** (`LOCKTAG_ADVISORY` with `USER_LOCKMETHOD`).
+
+### Race conditions prevented
+
+| Race | Without lock | With lock |
+|---|---|---|
+| Two INSERTs flush simultaneously | Both compute `stripe_id = N+1`; last writer's metadata entry wins; first writer's stripe file is orphaned and rows are lost | Second INSERT blocks until first finishes; each gets a unique `stripe_id` |
+| Two DELETEs target same stripe | Both read bitmap `0000`, each sets a different bit, last writer wins; other deletion is lost | Second DELETE blocks until first finishes; reads the already-updated bitmap and sets its bit correctly |
+| INSERT + VACUUM overlap | VACUUM reads metadata (N stripes); INSERT writes stripe N+1; VACUUM writes metadata with N entries — stripe N+1 lost | VACUUM and INSERT mutually block on the lock; whichever goes second sees the fully updated state |
+
+### Implementation
+
+**`columnar_acquire_write_lock(locator)`** — defined in `columnar_storage.c`,
+declared `extern` in `columnar_storage.h`:
+
+```c
+void
+columnar_acquire_write_lock(const RelFileLocator *locator)
+{
+    LOCKTAG tag;
+    SET_LOCKTAG_ADVISORY(tag,
+                         (uint32) PG_LOCATOR_DB(locator),
+                         (uint32) PG_LOCATOR_REL(locator),
+                         (uint32) 0,
+                         (uint16) 1);
+    LockAcquire(&tag, ExclusiveLock, false /* sessionLock */, false /* dontWait */);
+    /* Evict stale metadata cache so the next read comes from disk */
+    columnar_metadata_cache_evict(locator);
+}
+```
+
+**Lock tag**: keyed on `(dbOid, relNumber, 0, 1)` — field4=1 distinguishes this
+from user-created `pg_advisory_lock` calls which always use field4=0.
+
+**Lock mode**: `ExclusiveLock` in the advisory lock namespace (does NOT conflict
+with regular table locks — `AccessShareLock`, `RowExclusiveLock`, etc. — so
+read-only queries are never blocked).
+
+**Lock scope**: transaction-level (`sessionLock=false`) — auto-released at
+`AtCommit_Locks()`/`AtAbort_Locks()`. Re-entrant within the same transaction
+(second `LockAcquire` just increments the local count); safe for the
+auto-flush + commit-flush double-write path.
+
+**Metadata cache eviction**: done immediately after acquiring the lock so that
+the next `columnar_read_metadata` call reads from disk, picking up any stripes
+written by other backends since our last cache population.
+
+### Lock call sites
+
+| Function | File | Why |
+|---|---|---|
+| `columnar_write_stripe` | `columnar_storage.c` | Serialise metadata read + stripe write + metadata write |
+| `columnar_set_deleted_bit` | `columnar_storage.c` | Serialise bitmap read-modify-write; also evicts bitmap cache entry for this stripe |
+| `columnar_relation_vacuum` | `columnar_tableam.c` | Serialise VACUUM's metadata read + stripe removal + metadata write against concurrent DML |
+
+`columnar_compact` does not need the advisory lock because it acquires
+`ExclusiveLock` on the table (via `table_open(relOid, ExclusiveLock)`), which
+already blocks all concurrent DML.
+
+### Non-blocking reads
+
+All read-only paths (seq scan, index scan, ANALYZE) never call
+`columnar_acquire_write_lock`. Advisory locks are orthogonal to regular table
+access locks, so concurrent reads are never blocked while a write lock is held.
+
+---
+
 ## Bugs Found and Fixed
 
 ### Bug 1 — `ROW_COUNT` psql built-in variable collision

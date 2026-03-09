@@ -226,6 +226,20 @@ extern ColumnarStripeStats *columnar_read_stripe_stats(const RelFileLocator *loc
 extern void columnar_free_stripe_stats(ColumnarStripeStats *stats);
 
 /*
+ * Acquire the per-relation exclusive advisory write lock.
+ *
+ * Call this before any write to stripe files, delete bitmaps, or metadata.
+ * The lock is transaction-level: released automatically at transaction end.
+ * Re-entrant within the same transaction (safe for auto-flush + commit-flush).
+ * Also evicts the metadata cache so the next columnar_read_metadata call reads
+ * fresh from disk.
+ *
+ * Does not conflict with regular table access locks; read-only queries are
+ * never blocked.
+ */
+extern void columnar_acquire_write_lock(const RelFileLocator *locator);
+
+/*
  * Evict the stats cache entry for a single stripe.
  * Called from columnar_relation_vacuum() when the .stats file is removed
  * for a fully-deleted stripe.
