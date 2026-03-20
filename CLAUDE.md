@@ -109,10 +109,15 @@ a row in that stripe, and is read/modified with read-modify-write semantics.
 | `COLUMNAR_COMPRESSION_LZ4` | 1 | `columnar_storage.h` |
 | `COLUMNAR_COMPRESSION_ZSTD` | 2 | `columnar_storage.h` |
 
-### GUC
+### GUCs
 
-`columnar.compression` — session-level enum GUC (`none` / `lz4` / `zstd`).
-Registered in `_PG_init()` (lazy-loaded when first columnar relation is accessed).
+| GUC | Type | Default | Scope | Description |
+|---|---|---|---|---|
+| `columnar.compression` | enum | `none` | `PGC_USERSET` | Compression algorithm for new stripes: `none` / `lz4` / `zstd` |
+| `columnar.stripe_cache_size_mb` | int | `256` | `PGC_USERSET` | Per-backend IPC byte cache capacity (0 = disabled) |
+| `columnar.rows_per_stripe` | int | `10000` | `PGC_USERSET` | Rows buffered before flushing a stripe to disk |
+| `columnar.bloom_filter_bits` | int | `65536` | `PGC_USERSET` | Bits per column per bloom filter (8KB/column at default) |
+| `columnar.shared_pool_size_mb` | int | `0` | `PGC_SIGHUP` | Cross-backend shared pool size (0 = disabled; requires restart + shared_preload_libraries) |
 
 **Critical:** The library is loaded lazily. Always access a columnar relation once
 before issuing `SET columnar.compression = ...` or the SET will be silently ignored.
@@ -298,15 +303,92 @@ The saving is proportional to the number and size of skipped TEXT/BYTEA/NUMERIC 
 materialise even when not needed (just an array index read), so the speedup is most visible
 on tables with many variable-length columns.
 
-### Level 4 — Columnar Buffer Pool (planned)
+### Level 4 — Cross-Backend Shared Buffer Pool (implemented)
 
-Custom scan node + shared stripe RecordBatch cache.  Supersedes Level 2 (shared stripe
-cache alone). Not yet implemented.
+A shared memory arena that caches decompressed Arrow IPC stripe bytes across all backends.
+When one backend reads a stripe from disk and decompresses it, all other backends can
+serve subsequent reads from shared memory without any disk I/O or decompression overhead.
 
-The custom scan node is the key enabler: it will extract WHERE-clause quals at plan time
-and pass them as explicit `ScanKeyData` to `columnar_scan_begin`, allowing
-`columnar_stripe_should_skip` (Level 3) to prune stripes for all ordinary queries —
-not just callers that set `rs_nkeys > 0` manually.
+**GUC:** `columnar.shared_pool_size_mb` (default 0 = disabled). Must be set in
+`postgresql.conf` before adding `pg_columnar` to `shared_preload_libraries`. Requires a
+server restart to activate. Runtime changes via SIGHUP are ignored (pool size is fixed
+after shmem allocation). Registered as `PGC_SIGHUP | GUC_NOT_IN_SAMPLE` (not
+`PGC_POSTMASTER`, which fails for lazy-loaded extensions not in `shared_preload_libraries`).
+
+**Shared memory layout:**
+
+```c
+#define COLUMNAR_SHARED_POOL_MAX_ENTRIES 1024
+
+typedef struct ColumnarSharedPoolEntry {
+    Oid      dbOid;
+    Oid      relNumber;
+    int32    stripe_id;
+    uint32   arena_offset;  /* byte offset into inline arena */
+    uint32   size;          /* 0 = vacant slot */
+    uint64   lru_clock;
+} ColumnarSharedPoolEntry;
+
+typedef struct ColumnarSharedPool {
+    uint64   global_clock;
+    uint32   arena_next;    /* bump pointer */
+    uint32   arena_size;    /* total arena capacity in bytes */
+    ColumnarSharedPoolEntry directory[COLUMNAR_SHARED_POOL_MAX_ENTRIES];
+    /* uint8_t arena[arena_size] follows immediately in shmem */
+} ColumnarSharedPool;
+```
+
+The arena uses a **bump allocator with generational reset**: when `arena_next + size >
+arena_size`, ALL directory entries are invalidated (size=0) and `arena_next` resets to 0.
+This avoids fragmentation at the cost of a full cache flush when the arena fills — acceptable
+since stripe data is immutable (write-once) and cold stripes naturally fall out.
+
+**Directory eviction:** when all 1024 slots are occupied, the slot with the smallest
+`lru_clock` is evicted (LRU replacement). Linear scan over 1024 entries is O(1024) —
+acceptable since directory eviction is rare relative to query execution frequency.
+
+**Locking:** a single `LWLock` (`columnar_shared_pool` tranche, slot 0) guards all shared
+pool operations. `LW_EXCLUSIVE` is used for both reads and writes to avoid reader/writer
+complexity — simplicity over maximum concurrency (a shared lock for reads is a future opt).
+
+**Shmem lifecycle:**
+- `shmem_request_hook` (postmaster): `RequestAddinShmemSpace` + `RequestNamedLWLockTranche`
+- `shmem_startup_hook` (postmaster, after shmem allocated): `ShmemInitStruct` + `GetNamedLWLockTranche`
+- Workers inherit `shared_pool` and `shared_pool_lock` pointers via fork (valid since shmem
+  is mapped at the same virtual address in all processes)
+
+**Cache hierarchy (L4b → L4 → disk):**
+1. `columnar_open_stripe_stream` checks the per-backend HTAB (L4b) first.
+2. On L4b miss, checks the shared pool (L4): if found, copies bytes into L4b and serves from there.
+3. On both misses, reads and decompresses from disk, inserts into L4 (shared pool) then L4b.
+
+**Graceful degradation:** when `shared_pool == NULL` (not in `shared_preload_libraries`),
+all shared pool functions are no-ops. The L4b per-backend cache still provides full
+single-backend speedups. `shared_pool_misses` increments on every L4b miss regardless
+(tracking "would have hit the pool if configured").
+
+**`columnar_cache_stats()` output (14 fields):**
+
+| Field | Description |
+|---|---|
+| `shared_pool_hits` | Stripe bytes served from shared pool (cross-backend) |
+| `shared_pool_misses` | L4b misses where shared pool was checked (or would have been) |
+| `shared_pool_bytes` | Current `arena_next` — bytes resident in the shared pool arena |
+
+**Eviction:**
+- `columnar_shared_pool_evict_relation(locator)`: marks all entries for a relation as vacant.
+  Called from `columnar_remove_storage` on DROP TABLE / TRUNCATE. No per-stripe eviction
+  needed — stripes are write-once/immutable; only full-relation eviction is required.
+
+**Setup (when actually needed):**
+```conf
+# postgresql.conf
+shared_preload_libraries = 'pg_columnar'
+columnar.shared_pool_size_mb = 256
+```
+```bash
+# Then restart PostgreSQL and CREATE EXTENSION pg_columnar
+```
 
 ---
 

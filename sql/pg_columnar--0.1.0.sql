@@ -41,17 +41,20 @@ whether a min/max statistics file exists for the stripe, and whether a Bloom
 filter file exists for the stripe.';
 
 CREATE FUNCTION columnar_cache_stats(
-    OUT metadata_hits    bigint,
-    OUT metadata_misses  bigint,
-    OUT stats_hits       bigint,
-    OUT stats_misses     bigint,
-    OUT bitmap_hits      bigint,
-    OUT bitmap_misses    bigint,
-    OUT ipc_hits         bigint,
-    OUT ipc_misses       bigint,
-    OUT ipc_bytes_cached bigint,
-    OUT bloom_hits       bigint,
-    OUT bloom_misses     bigint
+    OUT metadata_hits         bigint,
+    OUT metadata_misses       bigint,
+    OUT stats_hits            bigint,
+    OUT stats_misses          bigint,
+    OUT bitmap_hits           bigint,
+    OUT bitmap_misses         bigint,
+    OUT ipc_hits              bigint,
+    OUT ipc_misses            bigint,
+    OUT ipc_bytes_cached      bigint,
+    OUT bloom_hits            bigint,
+    OUT bloom_misses          bigint,
+    OUT shared_pool_hits      bigint,
+    OUT shared_pool_misses    bigint,
+    OUT shared_pool_bytes     bigint
 )
 RETURNS record
 AS 'MODULE_PATHNAME', 'columnar_cache_stats'
@@ -76,10 +79,10 @@ are silently skipped by index scans.  Run REINDEX TABLE to remove them.
 Acquires ExclusiveLock for the duration — no concurrent access.';
 
 COMMENT ON FUNCTION columnar_cache_stats() IS
-'Returns cumulative cache hit/miss counters for all five columnar caching
-layers (metadata, stats, delete-bitmap, stripe IPC bytes, bloom filters) in
-the current backend, plus the number of bytes currently resident in the IPC
-bytes cache.';
+'Returns cumulative cache hit/miss counters for all six columnar caching
+layers (metadata, stats, delete-bitmap, stripe IPC bytes, bloom filters,
+shared buffer pool) in the current backend, plus the number of bytes
+currently resident in the per-backend IPC cache and the shared pool arena.';
 
 CREATE FUNCTION columnar_column_stats(
     relation    regclass,

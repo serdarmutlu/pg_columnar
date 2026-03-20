@@ -8,6 +8,9 @@
 #include "catalog/pg_class.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "storage/ipc.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
 #include "utils/guc.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -29,8 +32,12 @@ static void columnar_object_access_hook(ObjectAccessType access,
 										Oid objectId,
 										int subId,
 										void *arg);
+static void columnar_shmem_request(void);
+static void columnar_shmem_startup(void);
 
 static object_access_hook_type prev_object_access_hook = NULL;
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static Oid	columnar_am_oid = InvalidOid;
 
 /* GUC: columnar.compression */
@@ -44,6 +51,18 @@ int			columnar_rows_per_stripe = 10000;
 
 /* GUC: columnar.bloom_filter_bits */
 int			columnar_bloom_filter_bits = 65536;
+
+/*
+ * GUC: columnar.shared_pool_size_mb
+ * Size of the cross-backend shared buffer pool in MB.
+ * 0 = disabled (default).  Requires shared_preload_libraries and a server
+ * restart to activate.  PGC_POSTMASTER because it affects shared memory
+ * allocation at server startup.
+ */
+int			columnar_shared_pool_size_mb = 0;
+
+/* Set in columnar_shmem_request(); checked in columnar_shmem_startup() */
+static bool columnar_shared_pool_requested = false;
 
 static const struct config_enum_entry columnar_compression_options[] = {
 	{"none", COLUMNAR_COMPRESSION_NONE, false},
@@ -59,6 +78,39 @@ Datum
 columnar_handler(PG_FUNCTION_ARGS)
 {
 	PG_RETURN_POINTER(&columnar_am_methods);
+}
+
+/*
+ * shmem_request_hook: reserve shared memory for the columnar buffer pool.
+ * Called from the postmaster during CreateSharedMemoryAndSemaphores.
+ */
+static void
+columnar_shmem_request(void)
+{
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+
+	if (columnar_shared_pool_size_mb > 0)
+	{
+		RequestAddinShmemSpace(columnar_shared_pool_shmem_size());
+		RequestNamedLWLockTranche("columnar_shared_pool", 1);
+		columnar_shared_pool_requested = true;
+	}
+}
+
+/*
+ * shmem_startup_hook: attach to (or initialise) the columnar shared pool.
+ * Called from the postmaster after shared memory has been allocated; workers
+ * inherit the initialised pointers via fork.
+ */
+static void
+columnar_shmem_startup(void)
+{
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	if (columnar_shared_pool_requested)
+		columnar_shared_pool_attach();
 }
 
 void
@@ -115,6 +167,21 @@ _PG_init(void)
 							NULL,
 							NULL);
 
+	DefineCustomIntVariable("columnar.shared_pool_size_mb",
+							"Cross-backend shared buffer pool for decompressed stripe IPC bytes (MB). "
+							"0 = disabled (default). Set in postgresql.conf; requires shared_preload_libraries "
+							"and a server restart to take effect.",
+							NULL,
+							&columnar_shared_pool_size_mb,
+							0,		/* default: disabled */
+							0,		/* min: 0 (disabled) */
+							16384,	/* max: 16 GB */
+							PGC_SIGHUP,
+							GUC_UNIT_MB | GUC_NOT_IN_SAMPLE,
+							NULL,
+							NULL,
+							NULL);
+
 	RegisterXactCallback(columnar_xact_callback, NULL);
 
 	prev_object_access_hook = object_access_hook;
@@ -122,6 +189,13 @@ _PG_init(void)
 
 	/* Level 4: register custom scan provider for stripe pruning */
 	columnar_custom_scan_init();
+
+	/* Level 4 shared pool: install shmem hooks */
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = columnar_shmem_request;
+
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = columnar_shmem_startup;
 }
 
 /*

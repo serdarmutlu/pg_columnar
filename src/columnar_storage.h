@@ -23,6 +23,10 @@ extern int	columnar_compression;
 /* GUC variable — per-backend stripe IPC bytes cache size in MB (0 = disabled) */
 extern int	columnar_stripe_cache_size_mb;
 
+/* GUC variable — shared (cross-backend) buffer pool size in MB (0 = disabled).
+ * Requires shared_preload_libraries and a server restart to change. */
+extern int	columnar_shared_pool_size_mb;
+
 /* GUC variable — bloom filter size in bits per column per stripe (default 65536 = 8KB) */
 extern int	columnar_bloom_filter_bits;
 
@@ -392,6 +396,79 @@ extern void columnar_bloom_cache_evict_stripe(const RelFileLocator *locator,
 											  int stripe_id);
 
 /* ----------------------------------------------------------------
+ * Shared columnar buffer pool
+ *
+ * A cross-backend cache of decompressed Arrow IPC bytes stored in
+ * PostgreSQL shared memory.  Requires the extension to be loaded via
+ * shared_preload_libraries and columnar.shared_pool_size_mb > 0.
+ *
+ * Layout in shared memory:
+ *   ColumnarSharedPool header  (fixed, contains a 1024-entry directory)
+ *   char arena[]               (columnar.shared_pool_size_mb bytes)
+ *
+ * Directory entries use uint32 offsets into the arena so that no
+ * process-local pointers are stored in shared memory.
+ * ----------------------------------------------------------------
+ */
+
+#define COLUMNAR_SHARED_POOL_MAX_ENTRIES	1024
+
+typedef struct ColumnarSharedPoolEntry
+{
+	Oid			dbOid;			/* PG_LOCATOR_DB */
+	Oid			relNumber;		/* PG_LOCATOR_REL */
+	int32		stripe_id;
+	uint32		arena_offset;	/* byte offset of data in pool arena */
+	uint32		size;			/* byte count; 0 = vacant slot */
+	uint64		lru_clock;
+} ColumnarSharedPoolEntry;
+
+typedef struct ColumnarSharedPool
+{
+	uint64		global_clock;	/* incremented on every cache hit/insert */
+	uint32		arena_next;		/* next free byte in arena (bump allocator) */
+	uint32		arena_size;		/* total arena capacity in bytes */
+	ColumnarSharedPoolEntry directory[COLUMNAR_SHARED_POOL_MAX_ENTRIES];
+	/* uint8_t arena[arena_size] follows immediately */
+} ColumnarSharedPool;
+
+/*
+ * Returns the number of bytes to request via RequestAddinShmemSpace().
+ * Must be called with the GUC already set (i.e. from shmem_request_hook).
+ */
+extern Size columnar_shared_pool_shmem_size(void);
+
+/*
+ * Attach to (or initialise) the shared pool in shared memory.
+ * Called from shmem_startup_hook; must only be called when
+ * columnar_shared_pool_shmem_size() > 0.
+ */
+extern void columnar_shared_pool_attach(void);
+
+/*
+ * Shared pool lookup: returns a palloc'd copy of the cached IPC bytes in
+ * CurrentMemoryContext, or NULL on a miss.  Sets *out_size on a hit.
+ */
+extern uint8_t *columnar_shared_pool_lookup(const RelFileLocator *locator,
+											int stripe_id,
+											size_t *out_size);
+
+/*
+ * Shared pool insert: copies size bytes into the shared arena.
+ * No-op if the pool is disabled or the stripe is larger than the entire arena.
+ */
+extern void columnar_shared_pool_insert(const RelFileLocator *locator,
+										int stripe_id,
+										const uint8_t *bytes,
+										size_t size);
+
+/*
+ * Evict all shared-pool entries for a relation.
+ * Called from columnar_remove_storage() on DROP TABLE / TRUNCATE.
+ */
+extern void columnar_shared_pool_evict_relation(const RelFileLocator *locator);
+
+/* ----------------------------------------------------------------
  * Cache statistics
  * ----------------------------------------------------------------
  */
@@ -406,9 +483,12 @@ typedef struct ColumnarCacheStats
 	uint64		bitmap_misses;
 	uint64		ipc_hits;
 	uint64		ipc_misses;
-	size_t		ipc_bytes_cached;		/* current resident bytes */
+	size_t		ipc_bytes_cached;		/* current resident bytes in L4b */
 	uint64		bloom_hits;
 	uint64		bloom_misses;
+	uint64		shared_pool_hits;		/* cross-backend shared pool (L4) */
+	uint64		shared_pool_misses;
+	size_t		shared_pool_bytes;		/* bytes currently allocated in pool arena */
 } ColumnarCacheStats;
 
 /*

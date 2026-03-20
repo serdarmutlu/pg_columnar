@@ -312,6 +312,59 @@ columnar_open_stripe_stream(const RelFileLocator *locator,
 	}
 
 	/* ----------------------------------------------------------------
+	 * Level 4: check the shared buffer pool (cross-backend cache).
+	 *
+	 * On a hit we get a palloc'd copy of the decompressed IPC bytes,
+	 * populate the per-backend L4b cache for future same-session access,
+	 * then init the stream from the bytes.
+	 * ----------------------------------------------------------------
+	 */
+	{
+		size_t		sp_size = 0;
+		uint8_t    *sp_copy;
+
+		sp_copy = columnar_shared_pool_lookup(locator, sm->stripe_id, &sp_size);
+		if (sp_copy != NULL)
+		{
+			struct ArrowBuffer nanoarrow_buf;
+			int			rc;
+
+			/* Populate per-backend cache so future accesses in this session
+			 * don't need the shared-pool lock. */
+			columnar_stripe_ipc_cache_insert(locator, sm->stripe_id,
+											 sp_copy, sp_size);
+
+			ArrowBufferInit(&nanoarrow_buf);
+			if (ArrowBufferReserve(&nanoarrow_buf, (int64_t) sp_size)
+				!= NANOARROW_OK)
+			{
+				pfree(sp_copy);
+				pfree(filepath);
+				ereport(ERROR, (errmsg("columnar: ArrowBufferReserve failed "
+									   "(stripe %d shared pool hit)",
+									   sm->stripe_id)));
+			}
+			memcpy(nanoarrow_buf.data, sp_copy, sp_size);
+			nanoarrow_buf.size_bytes = (int64_t) sp_size;
+			pfree(sp_copy);
+
+			rc = ArrowIpcInputStreamInitBuffer(&input_stream, &nanoarrow_buf);
+			pfree(filepath);
+			if (rc != NANOARROW_OK)
+			{
+				ArrowBufferReset(&nanoarrow_buf);
+				ereport(ERROR, (errmsg("columnar: failed to init IPC buffer "
+									   "input stream from shared pool (stripe %d)",
+									   sm->stripe_id)));
+			}
+
+			columnar_finish_stream_init(&input_stream, out_stream, out_schema,
+										sm->stripe_id);
+			return;
+		}
+	}
+
+	/* ----------------------------------------------------------------
 	 * Cache miss: read from disk and populate the cache.
 	 * ----------------------------------------------------------------
 	 */
@@ -358,9 +411,12 @@ columnar_open_stripe_stream(const RelFileLocator *locator,
 		fclose(fp);
 		raw.size_bytes = sm->file_size;
 
-		/* Cache the raw IPC bytes before ArrowIpcInputStreamInitBuffer takes
-		 * ownership of the ArrowBuffer (the buffer's data pointer may move
-		 * during realloc inside nanoarrow; cache from raw.data now). */
+		/* Populate both the shared pool (L4) and per-backend cache (L4b).
+		 * Must happen before ArrowIpcInputStreamInitBuffer takes ownership
+		 * of the ArrowBuffer (the data pointer may move inside nanoarrow). */
+		columnar_shared_pool_insert(locator, sm->stripe_id,
+									(const uint8_t *) raw.data,
+									(size_t) sm->file_size);
 		columnar_stripe_ipc_cache_insert(locator, sm->stripe_id,
 										 (const uint8_t *) raw.data,
 										 (size_t) sm->file_size);
@@ -504,8 +560,11 @@ columnar_open_stripe_stream(const RelFileLocator *locator,
 		pfree(file_data);
 		pfree(filepath);
 
-		/* Cache the decompressed IPC bytes before ArrowIpcInputStreamInitBuffer
-		 * takes ownership of the ArrowBuffer. */
+		/* Populate both the shared pool (L4) and per-backend cache (L4b)
+		 * before ArrowIpcInputStreamInitBuffer takes ownership. */
+		columnar_shared_pool_insert(locator, sm->stripe_id,
+									(const uint8_t *) decompressed.data,
+									(size_t) decompressed.size_bytes);
 		columnar_stripe_ipc_cache_insert(locator, sm->stripe_id,
 										 (const uint8_t *) decompressed.data,
 										 (size_t) decompressed.size_bytes);
@@ -4327,8 +4386,8 @@ Datum
 columnar_cache_stats(PG_FUNCTION_ARGS)
 {
 	TupleDesc		tupdesc;
-	Datum			values[11];
-	bool			isnull[11] = {false};
+	Datum			values[14];
+	bool			isnull[14] = {false};
 	HeapTuple		tuple;
 	ColumnarCacheStats cs;
 
@@ -4350,6 +4409,9 @@ columnar_cache_stats(PG_FUNCTION_ARGS)
 	values[8]  = Int64GetDatum((int64) cs.ipc_bytes_cached);
 	values[9]  = Int64GetDatum((int64) cs.bloom_hits);
 	values[10] = Int64GetDatum((int64) cs.bloom_misses);
+	values[11] = Int64GetDatum((int64) cs.shared_pool_hits);
+	values[12] = Int64GetDatum((int64) cs.shared_pool_misses);
+	values[13] = Int64GetDatum((int64) cs.shared_pool_bytes);
 
 	tupdesc = BlessTupleDesc(tupdesc);
 	tuple   = heap_form_tuple(tupdesc, values, isnull);

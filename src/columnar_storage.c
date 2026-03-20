@@ -2,6 +2,8 @@
 
 #include "miscadmin.h"
 #include "storage/lock.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
 
@@ -1504,6 +1506,255 @@ columnar_stripe_ipc_cache_evict_relation(const RelFileLocator *locator)
 	pfree(keys);
 }
 
+/* ================================================================
+ * Level 4 — Shared Columnar Buffer Pool
+ *
+ * Cross-backend cache of decompressed Arrow IPC bytes in shared memory.
+ * Layout: ColumnarSharedPool header (with a 1024-entry directory) followed
+ * immediately by the raw arena bytes.
+ *
+ * Concurrency: one LWLock (LW_EXCLUSIVE for all operations for simplicity;
+ * memcpy of stripe bytes under the lock is cheaper than disk I/O).
+ *
+ * Eviction:
+ *   Directory: LRU scan when all COLUMNAR_SHARED_POOL_MAX_ENTRIES are full.
+ *   Arena: generational — when arena_next + new_size > arena_size, ALL
+ *   entries are invalidated and arena_next is reset to 0.  This eliminates
+ *   fragmentation at the cost of an occasional full-cache flush (acceptable
+ *   because the flush only occurs when every byte of the pool has been used).
+ * ================================================================
+ */
+
+/* Pointer into shared memory; NULL until columnar_shared_pool_attach() */
+static ColumnarSharedPool *shared_pool      = NULL;
+static LWLock             *shared_pool_lock = NULL;
+
+/* Per-backend counters (not shared) */
+static uint64  shared_pool_hits   = 0;
+static uint64  shared_pool_misses = 0;
+
+/* Convenience: pointer to the arena that follows the header */
+#define SHARED_POOL_ARENA(pool) \
+	((uint8_t *)(pool) + offsetof(ColumnarSharedPool, directory) \
+	 + sizeof((pool)->directory))
+
+/*
+ * Returns the total shared memory bytes needed for the pool.
+ */
+Size
+columnar_shared_pool_shmem_size(void)
+{
+	Size	header = offsetof(ColumnarSharedPool, directory)
+					 + sizeof(shared_pool->directory);
+	Size	arena  = (Size) columnar_shared_pool_size_mb * 1024 * 1024;
+
+	return add_size(header, arena);
+}
+
+/*
+ * Called from shmem_startup_hook (postmaster context).
+ * Initialises the shared pool on first call; on subsequent calls (after a
+ * crash-restart) it re-attaches to the already-initialised struct.
+ */
+void
+columnar_shared_pool_attach(void)
+{
+	bool		found;
+	Size		sz = columnar_shared_pool_shmem_size();
+	LWLockPadded *tranche;
+
+	Assert(columnar_shared_pool_size_mb > 0);
+
+	shared_pool = (ColumnarSharedPool *) ShmemInitStruct(
+		"columnar shared pool", sz, &found);
+
+	if (!found)
+	{
+		/* First time: zero everything, set metadata fields */
+		memset(shared_pool, 0, sz);
+		shared_pool->arena_size = (uint32) ((Size) columnar_shared_pool_size_mb
+											* 1024 * 1024);
+		shared_pool->arena_next = 0;
+		shared_pool->global_clock = 0;
+	}
+
+	tranche = GetNamedLWLockTranche("columnar_shared_pool");
+	shared_pool_lock = &tranche[0].lock;
+}
+
+/*
+ * Lookup stripe IPC bytes in the shared pool.
+ * Returns a palloc'd copy in CurrentMemoryContext on a hit; NULL on a miss.
+ */
+uint8_t *
+columnar_shared_pool_lookup(const RelFileLocator *locator,
+							int stripe_id,
+							size_t *out_size)
+{
+	Oid			db  = (Oid) PG_LOCATOR_DB(locator);
+	Oid			rel = (Oid) PG_LOCATOR_REL(locator);
+	int			i;
+	uint8_t    *result = NULL;
+
+	if (shared_pool == NULL)
+	{
+		shared_pool_misses++;
+		return NULL;
+	}
+
+	LWLockAcquire(shared_pool_lock, LW_EXCLUSIVE);
+
+	for (i = 0; i < COLUMNAR_SHARED_POOL_MAX_ENTRIES; i++)
+	{
+		ColumnarSharedPoolEntry *e = &shared_pool->directory[i];
+
+		if (e->size == 0)
+			continue;			/* vacant slot */
+		if (e->dbOid != db || e->relNumber != rel || e->stripe_id != stripe_id)
+			continue;
+
+		/* Hit — copy bytes out under the lock */
+		*out_size = e->size;
+		result = (uint8_t *) palloc(e->size);
+		memcpy(result,
+			   SHARED_POOL_ARENA(shared_pool) + e->arena_offset,
+			   e->size);
+		e->lru_clock = ++shared_pool->global_clock;
+		break;
+	}
+
+	LWLockRelease(shared_pool_lock);
+
+	if (result)
+		shared_pool_hits++;
+	else
+		shared_pool_misses++;
+
+	return result;
+}
+
+/*
+ * Insert stripe IPC bytes into the shared pool.
+ * No-op if: pool is disabled, stripe > entire arena, or already cached.
+ */
+void
+columnar_shared_pool_insert(const RelFileLocator *locator,
+							int stripe_id,
+							const uint8_t *bytes,
+							size_t size)
+{
+	Oid			db  = (Oid) PG_LOCATOR_DB(locator);
+	Oid			rel = (Oid) PG_LOCATOR_REL(locator);
+	ColumnarSharedPoolEntry *slot = NULL;
+	uint8_t    *arena;
+	int			i;
+
+	if (shared_pool == NULL || size == 0)
+		return;
+	if (size > (size_t) shared_pool->arena_size)
+		return;					/* stripe larger than entire pool — skip */
+
+	LWLockAcquire(shared_pool_lock, LW_EXCLUSIVE);
+
+	arena = SHARED_POOL_ARENA(shared_pool);
+
+	/* Already cached? (two backends racing to load the same stripe) */
+	for (i = 0; i < COLUMNAR_SHARED_POOL_MAX_ENTRIES; i++)
+	{
+		ColumnarSharedPoolEntry *e = &shared_pool->directory[i];
+
+		if (e->size > 0 &&
+			e->dbOid == db && e->relNumber == rel && e->stripe_id == stripe_id)
+		{
+			LWLockRelease(shared_pool_lock);
+			return;				/* already present */
+		}
+	}
+
+	/* Find a free slot */
+	for (i = 0; i < COLUMNAR_SHARED_POOL_MAX_ENTRIES; i++)
+	{
+		if (shared_pool->directory[i].size == 0)
+		{
+			slot = &shared_pool->directory[i];
+			break;
+		}
+	}
+
+	/* No free slot: evict the LRU entry */
+	if (slot == NULL)
+	{
+		uint64		min_clock = PG_UINT64_MAX;
+		int			lru_idx = 0;
+
+		for (i = 0; i < COLUMNAR_SHARED_POOL_MAX_ENTRIES; i++)
+		{
+			if (shared_pool->directory[i].lru_clock < min_clock)
+			{
+				min_clock = shared_pool->directory[i].lru_clock;
+				lru_idx = i;
+			}
+		}
+		shared_pool->directory[lru_idx].size = 0;	/* mark vacant */
+		slot = &shared_pool->directory[lru_idx];
+	}
+
+	/* Is there room in the arena? */
+	if ((size_t) shared_pool->arena_next + size > (size_t) shared_pool->arena_size)
+	{
+		/* Generational reset: invalidate all entries and start from 0 */
+		for (i = 0; i < COLUMNAR_SHARED_POOL_MAX_ENTRIES; i++)
+			shared_pool->directory[i].size = 0;
+		shared_pool->arena_next = 0;
+		slot = &shared_pool->directory[0];	/* first slot is now free */
+	}
+
+	/* Copy bytes into arena */
+	memcpy(arena + shared_pool->arena_next, bytes, size);
+
+	slot->dbOid        = db;
+	slot->relNumber    = rel;
+	slot->stripe_id    = stripe_id;
+	slot->arena_offset = shared_pool->arena_next;
+	slot->size         = (uint32) size;
+	slot->lru_clock    = ++shared_pool->global_clock;
+
+	/* Advance arena_next, aligned to 8 bytes */
+	shared_pool->arena_next =
+		(uint32) (((size_t) shared_pool->arena_next + size + 7) & ~(size_t) 7);
+	if (shared_pool->arena_next > shared_pool->arena_size)
+		shared_pool->arena_next = shared_pool->arena_size;
+
+	LWLockRelease(shared_pool_lock);
+}
+
+/*
+ * Evict all shared-pool entries for a relation.
+ * Called from columnar_remove_storage() on DROP TABLE / TRUNCATE.
+ */
+void
+columnar_shared_pool_evict_relation(const RelFileLocator *locator)
+{
+	Oid		db  = (Oid) PG_LOCATOR_DB(locator);
+	Oid		rel = (Oid) PG_LOCATOR_REL(locator);
+	int		i;
+
+	if (shared_pool == NULL)
+		return;
+
+	LWLockAcquire(shared_pool_lock, LW_EXCLUSIVE);
+
+	for (i = 0; i < COLUMNAR_SHARED_POOL_MAX_ENTRIES; i++)
+	{
+		ColumnarSharedPoolEntry *e = &shared_pool->directory[i];
+
+		if (e->size > 0 && e->dbOid == db && e->relNumber == rel)
+			e->size = 0;		/* mark vacant (arena bytes remain but unreachable) */
+	}
+
+	LWLockRelease(shared_pool_lock);
+}
+
 char *
 columnar_dir_path(const RelFileLocator *locator)
 {
@@ -1604,6 +1855,7 @@ columnar_remove_storage(const RelFileLocator *locator)
 	columnar_bitmap_cache_evict_relation(locator);
 	columnar_bloom_cache_evict_relation(locator);
 	columnar_stripe_ipc_cache_evict_relation(locator);
+	columnar_shared_pool_evict_relation(locator);
 
 	dir = opendir(dirpath);
 	if (dir == NULL)
@@ -2643,7 +2895,11 @@ columnar_get_cache_stats(ColumnarCacheStats *out)
 	out->bitmap_misses    = bitmap_cache_misses;
 	out->ipc_hits         = ipc_cache_hits;
 	out->ipc_misses       = ipc_cache_misses;
-	out->ipc_bytes_cached = stripe_ipc_total_bytes;
-	out->bloom_hits       = bloom_cache_hits;
-	out->bloom_misses     = bloom_cache_misses;
+	out->ipc_bytes_cached     = stripe_ipc_total_bytes;
+	out->bloom_hits           = bloom_cache_hits;
+	out->bloom_misses         = bloom_cache_misses;
+	out->shared_pool_hits     = shared_pool_hits;
+	out->shared_pool_misses   = shared_pool_misses;
+	out->shared_pool_bytes    = (shared_pool != NULL)
+		? (size_t) shared_pool->arena_next : 0;
 }
