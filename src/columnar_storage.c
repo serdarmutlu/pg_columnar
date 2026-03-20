@@ -20,6 +20,7 @@
 
 #include "nanoarrow.h"
 #include "nanoarrow_ipc.h"
+#include "columnar_bloom.h"
 #include "columnar_storage.h"
 
 /* Metadata format:
@@ -83,6 +84,8 @@ static uint64 bitmap_cache_hits     = 0;
 static uint64 bitmap_cache_misses   = 0;
 static uint64 ipc_cache_hits        = 0;
 static uint64 ipc_cache_misses      = 0;
+static uint64 bloom_cache_hits      = 0;
+static uint64 bloom_cache_misses    = 0;
 
 /*
  * Initialize the metadata cache.  Called lazily on first use.
@@ -658,6 +661,579 @@ columnar_bitmap_cache_evict_relation(const RelFileLocator *locator)
 }
 
 /* ----------------------------------------------------------------
+ * Backend-local per-stripe Bloom filter cache
+ *
+ * Bloom filter files (.bloom) are written once at flush time and never
+ * modified (stripes are immutable).  Caching them avoids repeated file
+ * reads during columnar_stripe_should_skip().
+ *
+ * Key:   (dbOid, relNumber, stripe_id)
+ * Value: has_filter[], all_bits[] arrays — all palloc'd in bloom_cache_ctx.
+ *
+ * Invalidation:
+ *   columnar_bloom_cache_evict_stripe()  — called from VACUUM when the
+ *   .bloom file is removed for a fully-deleted stripe.
+ *
+ *   columnar_bloom_cache_evict_relation() (static) — called from
+ *   columnar_remove_storage() on DROP TABLE / TRUNCATE.
+ * ----------------------------------------------------------------
+ */
+
+typedef struct ColumnarBloomCacheKey
+{
+	Oid			dbOid;
+	Oid			relNumber;
+	int			stripe_id;
+} ColumnarBloomCacheKey;
+
+typedef struct ColumnarBloomCacheEntry
+{
+	ColumnarBloomCacheKey key;		/* MUST be first */
+	bool		file_absent;		/* true = .bloom file confirmed missing */
+	int			ncols;
+	uint32_t	nbytes;				/* bytes per filter; 0 if file_absent */
+	uint8_t		nhashes;
+	bool	   *has_filter;			/* palloc'd in bloom_cache_ctx; NULL if ncols==0 */
+	uint8_t    *all_bits;			/* palloc'd in bloom_cache_ctx; NULL if ncols==0 */
+} ColumnarBloomCacheEntry;
+
+static HTAB *bloom_cache = NULL;
+static MemoryContext bloom_cache_ctx = NULL;
+
+static void
+columnar_bloom_cache_init(void)
+{
+	HASHCTL		ctl;
+
+	bloom_cache_ctx = AllocSetContextCreate(TopMemoryContext,
+											"columnar bloom cache",
+											ALLOCSET_SMALL_SIZES);
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(ColumnarBloomCacheKey);
+	ctl.entrysize = sizeof(ColumnarBloomCacheEntry);
+	ctl.hcxt = bloom_cache_ctx;
+
+	bloom_cache = hash_create("columnar bloom cache",
+							  64,
+							  &ctl,
+							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+static void
+columnar_bloom_cache_update(const RelFileLocator *locator,
+							int stripe_id,
+							const ColumnarStripeBloom *bloom)
+{
+	ColumnarBloomCacheKey key;
+	ColumnarBloomCacheEntry *entry;
+	bool		found;
+	MemoryContext oldcxt;
+
+	if (bloom_cache == NULL)
+		columnar_bloom_cache_init();
+
+	memset(&key, 0, sizeof(key));
+	key.dbOid = (Oid) PG_LOCATOR_DB(locator);
+	key.relNumber = (Oid) PG_LOCATOR_REL(locator);
+	key.stripe_id = stripe_id;
+
+	entry = hash_search(bloom_cache, &key, HASH_ENTER, &found);
+
+	/* Free previous allocations when overwriting */
+	if (found)
+	{
+		if (entry->has_filter)
+		{
+			pfree(entry->has_filter);
+			entry->has_filter = NULL;
+		}
+		if (entry->all_bits)
+		{
+			pfree(entry->all_bits);
+			entry->all_bits = NULL;
+		}
+	}
+
+	if (bloom == NULL)
+	{
+		entry->file_absent = true;
+		entry->ncols = 0;
+		entry->nbytes = 0;
+		entry->nhashes = 0;
+		entry->has_filter = NULL;
+		entry->all_bits = NULL;
+		return;
+	}
+
+	entry->file_absent = false;
+	entry->ncols = bloom->ncols;
+	entry->nbytes = bloom->nbytes;
+	entry->nhashes = bloom->nhashes;
+
+	if (bloom->ncols > 0)
+	{
+		size_t		bits_size = (size_t) bloom->ncols * bloom->nbytes;
+
+		oldcxt = MemoryContextSwitchTo(bloom_cache_ctx);
+		entry->has_filter = palloc(sizeof(bool) * bloom->ncols);
+		entry->all_bits = palloc0(bits_size);
+		MemoryContextSwitchTo(oldcxt);
+
+		memcpy(entry->has_filter, bloom->has_filter,
+			   sizeof(bool) * bloom->ncols);
+		if (bloom->all_bits)
+			memcpy(entry->all_bits, bloom->all_bits, bits_size);
+	}
+	else
+	{
+		entry->has_filter = NULL;
+		entry->all_bits = NULL;
+	}
+}
+
+void
+columnar_bloom_cache_evict_stripe(const RelFileLocator *locator, int stripe_id)
+{
+	ColumnarBloomCacheKey key;
+	ColumnarBloomCacheEntry *entry;
+	bool		found;
+
+	if (bloom_cache == NULL)
+		return;
+
+	memset(&key, 0, sizeof(key));
+	key.dbOid = (Oid) PG_LOCATOR_DB(locator);
+	key.relNumber = (Oid) PG_LOCATOR_REL(locator);
+	key.stripe_id = stripe_id;
+
+	entry = hash_search(bloom_cache, &key, HASH_FIND, &found);
+	if (found)
+	{
+		if (entry->has_filter)
+		{
+			pfree(entry->has_filter);
+			entry->has_filter = NULL;
+		}
+		if (entry->all_bits)
+		{
+			pfree(entry->all_bits);
+			entry->all_bits = NULL;
+		}
+	}
+	hash_search(bloom_cache, &key, HASH_REMOVE, NULL);
+}
+
+static void
+columnar_bloom_cache_evict_relation(const RelFileLocator *locator)
+{
+	Oid			target_db = (Oid) PG_LOCATOR_DB(locator);
+	Oid			target_rel = (Oid) PG_LOCATOR_REL(locator);
+	HASH_SEQ_STATUS seq;
+	ColumnarBloomCacheEntry *entry;
+	ColumnarBloomCacheKey *keys;
+	int			nkeys = 0;
+	int			maxkeys = 64;
+	int			i;
+
+	if (bloom_cache == NULL)
+		return;
+
+	keys = palloc(sizeof(ColumnarBloomCacheKey) * maxkeys);
+
+	hash_seq_init(&seq, bloom_cache);
+	while ((entry = (ColumnarBloomCacheEntry *) hash_seq_search(&seq)) != NULL)
+	{
+		if (entry->key.dbOid != target_db || entry->key.relNumber != target_rel)
+			continue;
+		if (nkeys >= maxkeys)
+		{
+			maxkeys *= 2;
+			keys = repalloc(keys, sizeof(ColumnarBloomCacheKey) * maxkeys);
+		}
+		keys[nkeys++] = entry->key;
+	}
+
+	for (i = 0; i < nkeys; i++)
+	{
+		bool		found;
+
+		entry = hash_search(bloom_cache, &keys[i], HASH_FIND, &found);
+		if (found)
+		{
+			if (entry->has_filter)
+			{
+				pfree(entry->has_filter);
+				entry->has_filter = NULL;
+			}
+			if (entry->all_bits)
+			{
+				pfree(entry->all_bits);
+				entry->all_bits = NULL;
+			}
+		}
+		hash_search(bloom_cache, &keys[i], HASH_REMOVE, NULL);
+	}
+
+	pfree(keys);
+}
+
+/* ----------------------------------------------------------------
+ * Bloom filter file I/O
+ * ----------------------------------------------------------------
+ */
+
+char *
+columnar_bloom_path(const RelFileLocator *locator, int stripe_id)
+{
+	char	   *path = palloc(MAXPGPATH);
+
+	snprintf(path, MAXPGPATH, "%s/stripe_%06d.bloom",
+			 columnar_dir_path(locator), stripe_id);
+	return path;
+}
+
+/*
+ * Collect bloom filters from a finished RecordBatch.
+ * col_types[i] is the PG OID of schema child i (0-based).
+ * Returns a palloc'd ColumnarStripeBloom (in CurrentMemoryContext).
+ */
+static ColumnarStripeBloom *
+columnar_collect_stripe_bloom(struct ArrowSchema *schema,
+							  struct ArrowArrayView *batch_view,
+							  int64_t nrows,
+							  const Oid *col_types,
+							  int ncol_types)
+{
+	int			ncols = (int) schema->n_children;
+	ColumnarStripeBloom *bloom;
+	uint32_t	nbytes;
+	uint8_t		nhashes;
+	int			i;
+	bool		any_bloom = false;
+
+	Assert(ncols == ncol_types);
+
+	bloom = palloc(sizeof(ColumnarStripeBloom));
+	bloom->ncols = ncols;
+
+	/*
+	 * Bloom filter size from GUC (in bits), converted to bytes.
+	 * Clamp to at least 128 bytes so nbits > 0 even if GUC is tiny.
+	 */
+	nbytes = (uint32_t) Max(128, columnar_bloom_filter_bits / 8);
+	bloom->nbytes = nbytes;
+	bloom->nhashes = nhashes = columnar_bloom_optimal_nhashes(nbytes, nrows);
+
+	if (ncols == 0)
+	{
+		bloom->has_filter = NULL;
+		bloom->all_bits = NULL;
+		return bloom;
+	}
+
+	bloom->has_filter = palloc0(sizeof(bool) * ncols);
+	bloom->all_bits = palloc0((size_t) ncols * nbytes);
+
+	for (i = 0; i < ncols; i++)
+	{
+		struct ArrowArrayView *col_view = batch_view->children[i];
+		const char *fmt = schema->children[i]->format;
+		int64_t		j;
+		uint8_t    *col_bits = bloom->all_bits + (size_t) i * nbytes;
+
+		/*
+		 * Build bloom filter only for supported types.  We use the PG OID
+		 * (not Arrow format) so NUMERIC ("u") is excluded from TEXT ("u").
+		 */
+		if (!columnar_bloom_oid_supported(col_types[i]))
+			continue;
+
+		bloom->has_filter[i] = true;
+		any_bloom = true;
+
+		for (j = 0; j < nrows; j++)
+		{
+			if (ArrowArrayViewIsNull(col_view, j))
+				continue;
+
+			if (strcmp(fmt, "u") == 0)
+			{
+				/* STRING (TEXT, VARCHAR) */
+				struct ArrowStringView sv =
+					ArrowArrayViewGetStringUnsafe(col_view, j);
+
+				columnar_bloom_add(col_bits, nbytes, nhashes,
+								   sv.data, (int32) sv.size_bytes);
+			}
+			else if (strcmp(fmt, "z") == 0)
+			{
+				/* BINARY (BYTEA) */
+				struct ArrowBufferView bv =
+					ArrowArrayViewGetBytesUnsafe(col_view, j);
+
+				columnar_bloom_add(col_bits, nbytes, nhashes,
+								   (const char *) bv.data.data,
+								   (int32) bv.size_bytes);
+			}
+			else if (strncmp(fmt, "w:", 2) == 0)
+			{
+				/* FIXED_SIZE_BINARY (UUID) */
+				struct ArrowBufferView bv =
+					ArrowArrayViewGetBytesUnsafe(col_view, j);
+
+				columnar_bloom_add(col_bits, nbytes, nhashes,
+								   (const char *) bv.data.data,
+								   (int32) bv.size_bytes);
+			}
+		}
+	}
+
+	if (!any_bloom)
+	{
+		/* No bloomable columns — return minimal struct */
+		pfree(bloom->has_filter);
+		pfree(bloom->all_bits);
+		bloom->has_filter = NULL;
+		bloom->all_bits = NULL;
+	}
+
+	return bloom;
+}
+
+void
+columnar_write_stripe_bloom(const RelFileLocator *locator,
+							int stripe_id,
+							const ColumnarStripeBloom *bloom)
+{
+	char	   *path;
+	FILE	   *fp;
+	int			i;
+	static const char magic[4] = "PGCB";
+	uint8_t		version = 0x01;
+	uint32_t	ncols32,
+				nbytes32;
+
+	if (bloom == NULL || bloom->ncols == 0 ||
+		bloom->has_filter == NULL || bloom->all_bits == NULL)
+		return;					/* nothing to write */
+
+	/* Check that at least one column has a filter */
+	{
+		bool		any = false;
+
+		for (i = 0; i < bloom->ncols; i++)
+			if (bloom->has_filter[i])
+			{
+				any = true;
+				break;
+			}
+		if (!any)
+			return;
+	}
+
+	path = columnar_bloom_path(locator, stripe_id);
+	fp = fopen(path, "wb");
+	if (fp == NULL)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("columnar: could not write bloom filter \"%s\": %m",
+						path)));
+		pfree(path);
+		return;
+	}
+	pfree(path);
+
+	ncols32 = (uint32_t) bloom->ncols;
+	nbytes32 = bloom->nbytes;
+
+	if (fwrite(magic, 1, 4, fp) != 4 ||
+		fwrite(&version, 1, 1, fp) != 1 ||
+		fwrite(&ncols32, sizeof(uint32_t), 1, fp) != 1 ||
+		fwrite(&nbytes32, sizeof(uint32_t), 1, fp) != 1 ||
+		fwrite(&bloom->nhashes, 1, 1, fp) != 1)
+		goto write_error;
+
+	for (i = 0; i < bloom->ncols; i++)
+	{
+		uint8_t		has = bloom->has_filter[i] ? 1 : 0;
+
+		if (fwrite(&has, 1, 1, fp) != 1)
+			goto write_error;
+		if (has)
+		{
+			const uint8_t *col_bits = bloom->all_bits + (size_t) i * bloom->nbytes;
+
+			if (fwrite(col_bits, 1, bloom->nbytes, fp) != bloom->nbytes)
+				goto write_error;
+		}
+	}
+
+	fclose(fp);
+
+	/* Populate the cache so subsequent reads are served from RAM */
+	columnar_bloom_cache_update(locator, stripe_id, bloom);
+	return;
+
+write_error:
+	ereport(WARNING,
+			(errcode_for_file_access(),
+			 errmsg("columnar: error writing bloom filter file: %m")));
+	fclose(fp);
+}
+
+ColumnarStripeBloom *
+columnar_read_stripe_bloom(const RelFileLocator *locator,
+						   int stripe_id, int expected_ncols)
+{
+	char	   *path;
+	FILE	   *fp;
+	char		magic[4];
+	uint8_t		version;
+	uint32_t	ncols32,
+				nbytes32;
+	uint8_t		nhashes;
+	ColumnarStripeBloom *bloom;
+	int			i;
+
+	/* Cache lookup */
+	{
+		ColumnarBloomCacheKey ckey;
+		ColumnarBloomCacheEntry *centry;
+		bool		found;
+
+		if (bloom_cache == NULL)
+			columnar_bloom_cache_init();
+
+		memset(&ckey, 0, sizeof(ckey));
+		ckey.dbOid = (Oid) PG_LOCATOR_DB(locator);
+		ckey.relNumber = (Oid) PG_LOCATOR_REL(locator);
+		ckey.stripe_id = stripe_id;
+
+		centry = hash_search(bloom_cache, &ckey, HASH_FIND, &found);
+		if (found)
+		{
+			bloom_cache_hits++;
+			if (centry->file_absent)
+				return NULL;
+			if (centry->ncols != expected_ncols)
+				return NULL;
+
+			/* Return a palloc'd copy */
+			bloom = palloc(sizeof(ColumnarStripeBloom));
+			bloom->ncols = centry->ncols;
+			bloom->nbytes = centry->nbytes;
+			bloom->nhashes = centry->nhashes;
+			if (centry->ncols > 0 && centry->has_filter && centry->all_bits)
+			{
+				size_t		bits_size = (size_t) centry->ncols * centry->nbytes;
+
+				bloom->has_filter = palloc(sizeof(bool) * centry->ncols);
+				bloom->all_bits = palloc(bits_size);
+				memcpy(bloom->has_filter, centry->has_filter,
+					   sizeof(bool) * centry->ncols);
+				memcpy(bloom->all_bits, centry->all_bits, bits_size);
+			}
+			else
+			{
+				bloom->has_filter = NULL;
+				bloom->all_bits = NULL;
+			}
+			return bloom;
+		}
+	}
+
+	/* Cache miss — read from disk */
+	bloom_cache_misses++;
+	path = columnar_bloom_path(locator, stripe_id);
+	fp = fopen(path, "rb");
+	pfree(path);
+	if (fp == NULL)
+	{
+		if (errno == ENOENT)
+			columnar_bloom_cache_update(locator, stripe_id, NULL);
+		return NULL;
+	}
+
+	if (fread(magic, 1, 4, fp) != 4 || memcmp(magic, "PGCB", 4) != 0 ||
+		fread(&version, 1, 1, fp) != 1 || version != 0x01 ||
+		fread(&ncols32, sizeof(uint32_t), 1, fp) != 1 ||
+		fread(&nbytes32, sizeof(uint32_t), 1, fp) != 1 ||
+		fread(&nhashes, 1, 1, fp) != 1)
+	{
+		fclose(fp);
+		return NULL;
+	}
+
+	if ((int) ncols32 != expected_ncols || nbytes32 == 0 || nhashes == 0)
+	{
+		fclose(fp);
+		return NULL;
+	}
+
+	bloom = palloc(sizeof(ColumnarStripeBloom));
+	bloom->ncols = (int) ncols32;
+	bloom->nbytes = nbytes32;
+	bloom->nhashes = nhashes;
+	bloom->has_filter = palloc0(sizeof(bool) * bloom->ncols);
+	bloom->all_bits = palloc0((size_t) bloom->ncols * bloom->nbytes);
+
+	for (i = 0; i < bloom->ncols; i++)
+	{
+		uint8_t		has;
+
+		if (fread(&has, 1, 1, fp) != 1)
+			goto read_error;
+
+		bloom->has_filter[i] = (has != 0);
+		if (has)
+		{
+			uint8_t    *col_bits = bloom->all_bits + (size_t) i * bloom->nbytes;
+
+			if (fread(col_bits, 1, bloom->nbytes, fp) != bloom->nbytes)
+				goto read_error;
+		}
+	}
+	fclose(fp);
+
+	columnar_bloom_cache_update(locator, stripe_id, bloom);
+	return bloom;
+
+read_error:
+	fclose(fp);
+	columnar_free_stripe_bloom(bloom);
+	return NULL;
+}
+
+void
+columnar_free_stripe_bloom(ColumnarStripeBloom *bloom)
+{
+	if (bloom == NULL)
+		return;
+	if (bloom->has_filter)
+		pfree(bloom->has_filter);
+	if (bloom->all_bits)
+		pfree(bloom->all_bits);
+	pfree(bloom);
+}
+
+bool
+columnar_bloom_stripe_test(const ColumnarStripeBloom *bloom,
+						   int child_idx,
+						   const char *data, int32 len)
+{
+	const uint8_t *col_bits;
+
+	if (bloom == NULL || child_idx >= bloom->ncols ||
+		!bloom->has_filter[child_idx] || bloom->all_bits == NULL)
+		return true;			/* no filter → assume present */
+
+	col_bits = bloom->all_bits + (size_t) child_idx * bloom->nbytes;
+	return columnar_bloom_test(col_bits, bloom->nbytes, bloom->nhashes, data, len);
+}
+
+/* ----------------------------------------------------------------
  * Backend-local per-stripe IPC bytes cache (Level 4b)
  *
  * Caches the decompressed Arrow IPC stream bytes for each stripe so
@@ -1026,6 +1602,7 @@ columnar_remove_storage(const RelFileLocator *locator)
 	columnar_metadata_cache_evict(locator);
 	columnar_stats_cache_evict_relation(locator);
 	columnar_bitmap_cache_evict_relation(locator);
+	columnar_bloom_cache_evict_relation(locator);
 	columnar_stripe_ipc_cache_evict_relation(locator);
 
 	dir = opendir(dirpath);
@@ -1594,7 +2171,9 @@ void
 columnar_write_stripe(const RelFileLocator *locator,
 					  struct ArrowSchema *schema,
 					  struct ArrowArrayView *batch_view,
-					  int64_t nrows)
+					  int64_t nrows,
+					  const Oid *col_types,
+					  int ncol_types)
 {
 	ColumnarMetadata *meta;
 	int			new_stripe_id;
@@ -1766,6 +2345,22 @@ columnar_write_stripe(const RelFileLocator *locator,
 		stripe_stats = columnar_collect_stripe_stats(schema, batch_view, nrows);
 		columnar_write_stripe_stats(locator, new_stripe_id, stripe_stats);
 		columnar_free_stripe_stats(stripe_stats);
+	}
+
+	/*
+	 * Collect and write per-column Bloom filters for string/binary columns.
+	 * Requires col_types[] to distinguish TEXT from NUMERIC (both stored
+	 * as Arrow string "u").  Failures emit a WARNING but do not abort.
+	 */
+	if (col_types != NULL && ncol_types == (int) schema->n_children)
+	{
+		ColumnarStripeBloom *stripe_bloom;
+
+		stripe_bloom = columnar_collect_stripe_bloom(schema, batch_view,
+													 nrows,
+													 col_types, ncol_types);
+		columnar_write_stripe_bloom(locator, new_stripe_id, stripe_bloom);
+		columnar_free_stripe_bloom(stripe_bloom);
 	}
 
 	/* Update metadata */
@@ -2049,4 +2644,6 @@ columnar_get_cache_stats(ColumnarCacheStats *out)
 	out->ipc_hits         = ipc_cache_hits;
 	out->ipc_misses       = ipc_cache_misses;
 	out->ipc_bytes_cached = stripe_ipc_total_bytes;
+	out->bloom_hits       = bloom_cache_hits;
+	out->bloom_misses     = bloom_cache_misses;
 }

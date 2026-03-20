@@ -9,6 +9,7 @@ OBJS = \
 	src/columnar_storage.o \
 	src/columnar_write_buffer.o \
 	src/columnar_typemap.o \
+	src/columnar_bloom.o \
 	vendor/nanoarrow/nanoarrow.o \
 	vendor/nanoarrow/nanoarrow_ipc.o \
 	vendor/nanoarrow/flatcc.o

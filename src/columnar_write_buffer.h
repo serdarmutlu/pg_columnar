@@ -9,8 +9,9 @@
 
 /*
  * Flush threshold: number of rows to buffer before writing a stripe.
+ * Controlled by the columnar.rows_per_stripe GUC (default 10000).
  */
-#define COLUMNAR_FLUSH_THRESHOLD 10000
+extern int	columnar_rows_per_stripe;
 
 /*
  * Per-column Arrow array builder.

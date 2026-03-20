@@ -3,6 +3,7 @@
 #include "catalog/pg_type_d.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
+#include "nodes/bitmapset.h"
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/numeric.h"
@@ -223,7 +224,8 @@ void
 columnar_populate_slot(TupleTableSlot *slot,
 					   struct ArrowArrayView *batch_view,
 					   int64_t row_index,
-					   TupleDesc tupdesc)
+					   TupleDesc tupdesc,
+					   const Bitmapset *required_cols)
 {
 	int			natts = tupdesc->natts;
 	int			child_idx = 0;
@@ -238,6 +240,19 @@ columnar_populate_slot(TupleTableSlot *slot,
 		{
 			slot->tts_isnull[i] = true;
 			slot->tts_values[i] = (Datum) 0;
+			continue;
+		}
+
+		/*
+		 * Projection pushdown: if the caller supplied a required_cols set,
+		 * skip columns not referenced by the query.  We still advance
+		 * child_idx so it stays aligned with the Arrow schema.
+		 */
+		if (required_cols != NULL && !bms_is_member(i, required_cols))
+		{
+			slot->tts_isnull[i] = true;
+			slot->tts_values[i] = (Datum) 0;
+			child_idx++;
 			continue;
 		}
 

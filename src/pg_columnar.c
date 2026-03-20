@@ -39,6 +39,12 @@ int			columnar_compression = COLUMNAR_COMPRESSION_NONE;
 /* GUC: columnar.stripe_cache_size_mb */
 int			columnar_stripe_cache_size_mb = 256;
 
+/* GUC: columnar.rows_per_stripe */
+int			columnar_rows_per_stripe = 10000;
+
+/* GUC: columnar.bloom_filter_bits */
+int			columnar_bloom_filter_bits = 65536;
+
 static const struct config_enum_entry columnar_compression_options[] = {
 	{"none", COLUMNAR_COMPRESSION_NONE, false},
 	{"lz4", COLUMNAR_COMPRESSION_LZ4, false},
@@ -79,6 +85,32 @@ _PG_init(void)
 							16384,	/* max: 16 GB */
 							PGC_USERSET,
 							GUC_UNIT_MB,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("columnar.rows_per_stripe",
+							"Number of rows to buffer before flushing a columnar stripe to disk.",
+							NULL,
+							&columnar_rows_per_stripe,
+							10000,	/* default */
+							100,	/* min: 100 rows */
+							10000000, /* max: 10M rows */
+							PGC_USERSET,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("columnar.bloom_filter_bits",
+							"Size of the per-column Bloom filter in bits (higher = fewer false positives).",
+							NULL,
+							&columnar_bloom_filter_bits,
+							65536,		/* default: 64Kbits = 8KB per column */
+							1024,		/* min: 1Kbits */
+							8388608,	/* max: 8Mbits = 1MB per column */
+							PGC_USERSET,
+							0,
 							NULL,
 							NULL,
 							NULL);

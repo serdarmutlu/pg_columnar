@@ -23,6 +23,9 @@ extern int	columnar_compression;
 /* GUC variable — per-backend stripe IPC bytes cache size in MB (0 = disabled) */
 extern int	columnar_stripe_cache_size_mb;
 
+/* GUC variable — bloom filter size in bits per column per stripe (default 65536 = 8KB) */
+extern int	columnar_bloom_filter_bits;
+
 /*
  * Metadata for a single stripe.
  */
@@ -90,7 +93,9 @@ extern void columnar_write_metadata(const RelFileLocator *locator,
 extern void columnar_write_stripe(const RelFileLocator *locator,
 								  struct ArrowSchema *schema,
 								  struct ArrowArrayView *batch_view,
-								  int64_t nrows);
+								  int64_t nrows,
+								  const Oid *col_types,
+								  int ncol_types);
 
 /*
  * Compute the total size of all files in the columnar storage directory.
@@ -303,6 +308,90 @@ extern void columnar_stripe_ipc_cache_insert(const RelFileLocator *locator,
 extern void columnar_stripe_ipc_cache_evict_relation(const RelFileLocator *locator);
 
 /* ----------------------------------------------------------------
+ * Per-stripe Bloom filters
+ *
+ * Each stripe that has at least one bloomable column gets a companion file:
+ *   $PGDATA/columnar/<dbOid>/<relfilenode>/stripe_XXXXXX.bloom
+ *
+ * Bloomable types: TEXT, VARCHAR, BYTEA, UUID.
+ * NUMERIC is excluded — different input representations ("1" vs "1.00")
+ * would cause false negatives.
+ *
+ * File format (binary, native byte order — local storage only):
+ *   Magic:   "PGCB" (4 bytes)
+ *   Version: 0x01   (1 byte)
+ *   ncols:   uint32 (4 bytes) — number of Arrow schema children
+ *   nbytes:  uint32 (4 bytes) — bytes per filter (same for all columns)
+ *   nhashes: uint8  (1 byte)  — hash functions (same for all columns)
+ *   Per column i = 0 .. ncols-1:
+ *     has_bloom: uint8 (0 or 1)
+ *     if has_bloom: bits[nbytes]
+ *
+ * The in-memory struct uses a flat allocation for efficiency:
+ *   has_filter[ncols]              — palloc'd
+ *   all_bits[ncols * nbytes]       — palloc'd; bits for col i start at i*nbytes
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * In-memory representation of all bloom filters for one stripe.
+ * Returned by columnar_read_stripe_bloom(); caller must free with
+ * columnar_free_stripe_bloom().
+ */
+typedef struct ColumnarStripeBloom
+{
+	int			ncols;
+	uint32_t	nbytes;			/* bytes per filter */
+	uint8_t		nhashes;
+	bool	   *has_filter;		/* has_filter[i]: column i has a bloom filter */
+	uint8_t    *all_bits;		/* all_bits + (size_t)i * nbytes: filter for col i */
+} ColumnarStripeBloom;
+
+/*
+ * Build the path for a stripe's bloom filter file.
+ */
+extern char *columnar_bloom_path(const RelFileLocator *locator, int stripe_id);
+
+/*
+ * Write bloom filters to stripe_XXXXXX.bloom.
+ * Failures are emitted as WARNINGs; bloom filters are advisory.
+ */
+extern void columnar_write_stripe_bloom(const RelFileLocator *locator,
+										int stripe_id,
+										const ColumnarStripeBloom *bloom);
+
+/*
+ * Read bloom filters for a stripe.
+ * Returns a palloc'd ColumnarStripeBloom, or NULL if the file is absent
+ * or the ncols does not match expected_ncols.
+ */
+extern ColumnarStripeBloom *columnar_read_stripe_bloom(const RelFileLocator *locator,
+													   int stripe_id,
+													   int expected_ncols);
+
+/*
+ * Free a ColumnarStripeBloom returned by columnar_read_stripe_bloom.
+ */
+extern void columnar_free_stripe_bloom(ColumnarStripeBloom *bloom);
+
+/*
+ * Test whether a byte string is possibly present in column child_idx.
+ * Convenience wrapper around columnar_bloom_test() that handles missing
+ * filters (returns true = possibly present when no filter exists).
+ */
+extern bool columnar_bloom_stripe_test(const ColumnarStripeBloom *bloom,
+									   int child_idx,
+									   const char *data, int32 len);
+
+/*
+ * Evict the bloom cache entry for a single stripe.
+ * Called from columnar_relation_vacuum() when the .bloom file is removed
+ * for a fully-deleted stripe.
+ */
+extern void columnar_bloom_cache_evict_stripe(const RelFileLocator *locator,
+											  int stripe_id);
+
+/* ----------------------------------------------------------------
  * Cache statistics
  * ----------------------------------------------------------------
  */
@@ -318,6 +407,8 @@ typedef struct ColumnarCacheStats
 	uint64		ipc_hits;
 	uint64		ipc_misses;
 	size_t		ipc_bytes_cached;		/* current resident bytes */
+	uint64		bloom_hits;
+	uint64		bloom_misses;
 } ColumnarCacheStats;
 
 /*

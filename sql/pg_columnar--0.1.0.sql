@@ -27,7 +27,8 @@ CREATE FUNCTION columnar_stripe_info(
     OUT file_size   bigint,
     OUT compression text,
     OUT deleted_rows bigint,
-    OUT has_stats   bool
+    OUT has_stats   bool,
+    OUT has_bloom   bool
 )
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'columnar_stripe_info'
@@ -36,7 +37,8 @@ LANGUAGE C STRICT;
 COMMENT ON FUNCTION columnar_stripe_info(regclass) IS
 'Returns one row per stripe for a columnar table with stripe_id, row_count,
 file_size (bytes), compression algorithm, number of logically deleted rows,
-and whether a min/max statistics file exists for the stripe.';
+whether a min/max statistics file exists for the stripe, and whether a Bloom
+filter file exists for the stripe.';
 
 CREATE FUNCTION columnar_cache_stats(
     OUT metadata_hits    bigint,
@@ -47,7 +49,9 @@ CREATE FUNCTION columnar_cache_stats(
     OUT bitmap_misses    bigint,
     OUT ipc_hits         bigint,
     OUT ipc_misses       bigint,
-    OUT ipc_bytes_cached bigint
+    OUT ipc_bytes_cached bigint,
+    OUT bloom_hits       bigint,
+    OUT bloom_misses     bigint
 )
 RETURNS record
 AS 'MODULE_PATHNAME', 'columnar_cache_stats'
@@ -72,9 +76,30 @@ are silently skipped by index scans.  Run REINDEX TABLE to remove them.
 Acquires ExclusiveLock for the duration — no concurrent access.';
 
 COMMENT ON FUNCTION columnar_cache_stats() IS
-'Returns cumulative cache hit/miss counters for all four columnar caching
-layers (metadata, stats, delete-bitmap, stripe IPC bytes) in the current
-backend, plus the number of bytes currently resident in the IPC bytes cache.';
+'Returns cumulative cache hit/miss counters for all five columnar caching
+layers (metadata, stats, delete-bitmap, stripe IPC bytes, bloom filters) in
+the current backend, plus the number of bytes currently resident in the IPC
+bytes cache.';
+
+CREATE FUNCTION columnar_column_stats(
+    relation    regclass,
+    OUT stripe_id  int,
+    OUT attnum     int,
+    OUT col_name   text,
+    OUT stat_type  text,
+    OUT has_stats  bool,
+    OUT min_value  text,
+    OUT max_value  text
+)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'columnar_column_stats'
+LANGUAGE C STRICT;
+
+COMMENT ON FUNCTION columnar_column_stats(regclass) IS
+'Returns one row per (stripe, non-dropped column) for a columnar table.
+stat_type is ''none'' (text/bool/uuid/etc.), ''int'' (integer/date/timestamp),
+or ''float'' (float4/float8).  min_value and max_value are NULL when stat_type
+is ''none'' or the column was entirely NULL in that stripe (has_stats = false).';
 
 CREATE FUNCTION columnar_rebuild_metadata(
     relation            regclass,

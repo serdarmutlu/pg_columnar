@@ -52,7 +52,12 @@
 									 * get_opclass_family, get_commutator */
 #include "catalog/pg_am.h"		/* Form_pg_am */
 #include "catalog/pg_class.h"	/* Form_pg_class */
+#include "nodes/bitmapset.h"	/* Bitmapset, bms_add_member, bms_is_member */
+#include "utils/uuid.h"		/* pg_uuid_t, UUID_LEN */
+
+#include "columnar_bloom.h"	/* columnar_bloom_test, columnar_bloom_oid_supported */
 #include "nodes/nodeFuncs.h"	/* exprCollation */
+#include "optimizer/optimizer.h"	/* pull_var_clause, PVC_RECURSE_* */
 #include "utils/syscache.h"		/* SearchSysCache1, ReleaseSysCache, AMNAME, RELOID */
 
 /* Forward declarations */
@@ -98,6 +103,15 @@ typedef struct ColumnarScanDescData
 
 	/* Count of stripes skipped by min/max pruning (Level 4 custom scan) */
 	int64_t		stripes_skipped;
+
+	/*
+	 * Projection pushdown: bitmapset of 0-based attribute indexes that the
+	 * query actually needs.  NULL means all columns are required (conservative
+	 * default used by sequential scan, index fetch, ANALYZE, and compaction).
+	 * Set by columnar_begin_custom_scan after inspecting the plan targetlist
+	 * and quals via pull_var_clause.
+	 */
+	Bitmapset  *required_cols;
 } ColumnarScanDescData;
 
 typedef ColumnarScanDescData *ColumnarScanDesc;
@@ -597,12 +611,13 @@ columnar_stripe_should_skip(const RelFileLocator *locator,
 							TupleDesc tupdesc)
 {
 	ColumnarStripeStats *stats;
+	ColumnarStripeBloom *bloom;
 	int			k;
 	bool		skip = false;
 	int			ncols;
 	int			a;
 
-	/* Count non-dropped columns — must match the stats file's ncols */
+	/* Count non-dropped columns — must match both stats and bloom file ncols */
 	ncols = 0;
 	for (a = 0; a < tupdesc->natts; a++)
 	{
@@ -611,15 +626,16 @@ columnar_stripe_should_skip(const RelFileLocator *locator,
 	}
 
 	stats = columnar_read_stripe_stats(locator, sm->stripe_id, ncols);
-	if (stats == NULL)
-		return false;			/* no stats → cannot prune */
+	bloom = columnar_read_stripe_bloom(locator, sm->stripe_id, ncols);
+
+	if (stats == NULL && bloom == NULL)
+		return false;			/* no pruning data available */
 
 	for (k = 0; k < nkeys && !skip; k++)
 	{
 		struct ScanKeyData *key = &keys[k];
 		AttrNumber	attno = key->sk_attno;	/* 1-based */
 		Form_pg_attribute attr;
-		ColumnarColumnStats *cs;
 		int			child_idx;
 
 		/* Ignore NULL-related scan flags */
@@ -641,127 +657,187 @@ columnar_stripe_should_skip(const RelFileLocator *locator,
 				child_idx++;
 		}
 
-		if (child_idx >= stats->ncols)
-			continue;
-
-		cs = &stats->cols[child_idx];
-
-		if (!cs->has_stats || cs->stat_type == COLUMNAR_STAT_TYPE_NONE)
-			continue;
-
-		if (cs->stat_type == COLUMNAR_STAT_TYPE_INT)
+		/*
+		 * Bloom filter check for equality predicates on supported types.
+		 * A "definitely absent" result from the bloom filter lets us skip
+		 * the stripe even when no min/max stats exist for the column.
+		 *
+		 * Supported: TEXT, VARCHAR, BYTEA, UUID.
+		 * NUMERIC excluded (different string forms of same value would cause
+		 * false negatives, which would silently drop rows — unacceptable).
+		 */
+		if (bloom != NULL && key->sk_strategy == BTEqualStrategyNumber)
 		{
-			int64_t		key_val;
-			int64_t		stripe_min = cs->min_int;
-			int64_t		stripe_max = cs->max_int;
-
-			/*
-			 * Extract the comparison value in PG-epoch units.  These
-			 * match exactly what columnar_collect_stripe_stats stored:
-			 *   INT2/4/8  → raw integer
-			 *   DATE       → days since PG epoch (2000-01-01)
-			 *   TIMESTAMP  → µs since PG epoch
-			 */
 			switch (attr->atttypid)
 			{
-				case INT2OID:
-					key_val = (int64_t) DatumGetInt16(key->sk_argument);
-					break;
-				case INT4OID:
-					key_val = (int64_t) DatumGetInt32(key->sk_argument);
-					break;
-				case INT8OID:
-					key_val = DatumGetInt64(key->sk_argument);
-					break;
-				case DATEOID:
-					key_val = (int64_t) DatumGetDateADT(key->sk_argument);
-					break;
-				case TIMESTAMPOID:
-				case TIMESTAMPTZOID:
-					key_val = (int64_t) DatumGetTimestamp(key->sk_argument);
-					break;
-				default:
-					continue;	/* unsupported type — skip this key */
-			}
+				case TEXTOID:
+				case VARCHAROID:
+				{
+					text	   *t = DatumGetTextPP(key->sk_argument);
 
-			switch (key->sk_strategy)
-			{
-				case BTLessStrategyNumber:
-					/* col < key: impossible if stripe_min >= key */
-					if (stripe_min >= key_val)
+					if (!columnar_bloom_stripe_test(bloom, child_idx,
+													VARDATA_ANY(t),
+													VARSIZE_ANY_EXHDR(t)))
 						skip = true;
 					break;
-				case BTLessEqualStrategyNumber:
-					/* col <= key: impossible if stripe_min > key */
-					if (stripe_min > key_val)
+				}
+				case BYTEAOID:
+				{
+					bytea	   *b = DatumGetByteaPP(key->sk_argument);
+
+					if (!columnar_bloom_stripe_test(bloom, child_idx,
+													VARDATA_ANY(b),
+													VARSIZE_ANY_EXHDR(b)))
 						skip = true;
 					break;
-				case BTEqualStrategyNumber:
-					/* col = key: impossible if key outside [min, max] */
-					if (key_val < stripe_min || key_val > stripe_max)
+				}
+				case UUIDOID:
+				{
+					pg_uuid_t  *uuid = DatumGetUUIDP(key->sk_argument);
+
+					if (!columnar_bloom_stripe_test(bloom, child_idx,
+													(const char *) uuid->data,
+													UUID_LEN))
 						skip = true;
 					break;
-				case BTGreaterEqualStrategyNumber:
-					/* col >= key: impossible if stripe_max < key */
-					if (stripe_max < key_val)
-						skip = true;
-					break;
-				case BTGreaterStrategyNumber:
-					/* col > key: impossible if stripe_max <= key */
-					if (stripe_max <= key_val)
-						skip = true;
-					break;
+				}
 				default:
-					break;
+					break;		/* not a bloom-supported type */
 			}
 		}
-		else					/* COLUMNAR_STAT_TYPE_FLOAT */
+
+		if (skip)
+			continue;			/* bloom already pruned this stripe */
+
+		/*
+		 * Min/max statistics check for integer and float types.
+		 */
+		if (stats == NULL || child_idx >= stats->ncols)
+			continue;
+
 		{
-			double		key_val;
-			double		stripe_min = cs->min_float;
-			double		stripe_max = cs->max_float;
+			ColumnarColumnStats *cs = &stats->cols[child_idx];
 
-			switch (attr->atttypid)
+			if (!cs->has_stats || cs->stat_type == COLUMNAR_STAT_TYPE_NONE)
+				continue;
+
+			if (cs->stat_type == COLUMNAR_STAT_TYPE_INT)
 			{
-				case FLOAT4OID:
-					key_val = (double) DatumGetFloat4(key->sk_argument);
-					break;
-				case FLOAT8OID:
-					key_val = DatumGetFloat8(key->sk_argument);
-					break;
-				default:
-					continue;
+				int64_t		key_val;
+				int64_t		stripe_min = cs->min_int;
+				int64_t		stripe_max = cs->max_int;
+
+				/*
+				 * Extract the comparison value in PG-epoch units.  These
+				 * match exactly what columnar_collect_stripe_stats stored:
+				 *   INT2/4/8  → raw integer
+				 *   DATE       → days since PG epoch (2000-01-01)
+				 *   TIMESTAMP  → µs since PG epoch
+				 */
+				switch (attr->atttypid)
+				{
+					case INT2OID:
+						key_val = (int64_t) DatumGetInt16(key->sk_argument);
+						break;
+					case INT4OID:
+						key_val = (int64_t) DatumGetInt32(key->sk_argument);
+						break;
+					case INT8OID:
+						key_val = DatumGetInt64(key->sk_argument);
+						break;
+					case DATEOID:
+						key_val = (int64_t) DatumGetDateADT(key->sk_argument);
+						break;
+					case TIMESTAMPOID:
+					case TIMESTAMPTZOID:
+						key_val = (int64_t) DatumGetTimestamp(key->sk_argument);
+						break;
+					default:
+						continue; /* unsupported type — skip this key */
+				}
+
+				switch (key->sk_strategy)
+				{
+					case BTLessStrategyNumber:
+						/* col < key: impossible if stripe_min >= key */
+						if (stripe_min >= key_val)
+							skip = true;
+						break;
+					case BTLessEqualStrategyNumber:
+						/* col <= key: impossible if stripe_min > key */
+						if (stripe_min > key_val)
+							skip = true;
+						break;
+					case BTEqualStrategyNumber:
+						/* col = key: impossible if key outside [min, max] */
+						if (key_val < stripe_min || key_val > stripe_max)
+							skip = true;
+						break;
+					case BTGreaterEqualStrategyNumber:
+						/* col >= key: impossible if stripe_max < key */
+						if (stripe_max < key_val)
+							skip = true;
+						break;
+					case BTGreaterStrategyNumber:
+						/* col > key: impossible if stripe_max <= key */
+						if (stripe_max <= key_val)
+							skip = true;
+						break;
+					default:
+						break;
+				}
 			}
-
-			switch (key->sk_strategy)
+			else				/* COLUMNAR_STAT_TYPE_FLOAT */
 			{
-				case BTLessStrategyNumber:
-					if (stripe_min >= key_val)
-						skip = true;
-					break;
-				case BTLessEqualStrategyNumber:
-					if (stripe_min > key_val)
-						skip = true;
-					break;
-				case BTEqualStrategyNumber:
-					if (key_val < stripe_min || key_val > stripe_max)
-						skip = true;
-					break;
-				case BTGreaterEqualStrategyNumber:
-					if (stripe_max < key_val)
-						skip = true;
-					break;
-				case BTGreaterStrategyNumber:
-					if (stripe_max <= key_val)
-						skip = true;
-					break;
-				default:
-					break;
+				double		key_val;
+				double		stripe_min = cs->min_float;
+				double		stripe_max = cs->max_float;
+
+				switch (attr->atttypid)
+				{
+					case FLOAT4OID:
+						key_val = (double) DatumGetFloat4(key->sk_argument);
+						break;
+					case FLOAT8OID:
+						key_val = DatumGetFloat8(key->sk_argument);
+						break;
+					default:
+						continue;
+				}
+
+				switch (key->sk_strategy)
+				{
+					case BTLessStrategyNumber:
+						if (stripe_min >= key_val)
+							skip = true;
+						break;
+					case BTLessEqualStrategyNumber:
+						if (stripe_min > key_val)
+							skip = true;
+						break;
+					case BTEqualStrategyNumber:
+						if (key_val < stripe_min || key_val > stripe_max)
+							skip = true;
+						break;
+					case BTGreaterEqualStrategyNumber:
+						if (stripe_max < key_val)
+							skip = true;
+						break;
+					case BTGreaterStrategyNumber:
+						if (stripe_max <= key_val)
+							skip = true;
+						break;
+					default:
+						break;
+				}
 			}
 		}
 	}
 
-	columnar_free_stripe_stats(stats);
+	if (stats != NULL)
+		columnar_free_stripe_stats(stats);
+	if (bloom != NULL)
+		columnar_free_stripe_bloom(bloom);
 	return skip;
 }
 
@@ -902,7 +978,8 @@ columnar_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
 			}
 
 			columnar_populate_slot(slot, &scan->batch_view,
-								   scan->batch_row_index, tupdesc);
+								   scan->batch_row_index, tupdesc,
+								   scan->required_cols);
 
 			/* Synthesize a TID */
 			ItemPointerSet(&slot->tts_tid,
@@ -1053,6 +1130,16 @@ columnar_scan_getnextslot(TableScanDesc sscan, ScanDirection direction,
 					{
 						slot->tts_isnull[i] = true;
 						slot->tts_values[i] = (Datum) 0;
+						continue;
+					}
+
+					/* Projection pushdown: skip columns not needed by query */
+					if (scan->required_cols != NULL &&
+						!bms_is_member(i, scan->required_cols))
+					{
+						slot->tts_isnull[i] = true;
+						slot->tts_values[i] = (Datum) 0;
+						child_idx++;
 						continue;
 					}
 
@@ -1593,7 +1680,7 @@ columnar_index_fetch_tuple(struct IndexFetchTableData *scan,
 		return false;
 
 	/* Populate the slot from the cached batch */
-	columnar_populate_slot(slot, &iscan->batch_view, row_idx, tupdesc);
+	columnar_populate_slot(slot, &iscan->batch_view, row_idx, tupdesc, NULL);
 	ItemPointerCopy(tid, &slot->tts_tid);
 	ExecStoreVirtualTuple(slot);
 
@@ -1720,7 +1807,7 @@ columnar_tuple_insert(Relation rel, TupleTableSlot *slot,
 
 
 	/* Auto-flush when buffer is full */
-	if (buf->nrows >= COLUMNAR_FLUSH_THRESHOLD)
+	if (buf->nrows >= columnar_rows_per_stripe)
 		columnar_flush_write_buffer(buf);
 }
 
@@ -2116,23 +2203,27 @@ columnar_relation_vacuum(Relation rel, struct VacuumParams *params,
 			char	   *stripe_path = columnar_stripe_path(locator, sm->stripe_id);
 			char	   *del_path = columnar_deleted_path(locator, sm->stripe_id);
 			char	   *stats_path = columnar_stats_path(locator, sm->stripe_id);
+			char	   *bloom_path = columnar_bloom_path(locator, sm->stripe_id);
 
 			(void) unlink(stripe_path);
 			(void) unlink(del_path);
 			(void) unlink(stats_path);	/* optional; ignore if absent */
+			(void) unlink(bloom_path);	/* optional; ignore if absent */
 			pfree(stripe_path);
 			pfree(del_path);
 			pfree(stats_path);
+			pfree(bloom_path);
 
 			/*
-			 * Evict both the stats cache and the bitmap cache for this
-			 * stripe.  Their files have been removed from disk, and the
-			 * stripe's row_count is about to be zeroed.  Evicting keeps
-			 * memory clean and removes any file_absent marker that a
-			 * future table reusing the same relfilenode might inherit.
+			 * Evict the stats, bitmap, and bloom caches for this stripe.
+			 * Their files have been removed from disk, and the stripe's
+			 * row_count is about to be zeroed.  Evicting keeps memory
+			 * clean and removes any file_absent marker that a future table
+			 * reusing the same relfilenode might inherit.
 			 */
 			columnar_stats_cache_evict_stripe(locator, sm->stripe_id);
 			columnar_bitmap_cache_evict_stripe(locator, sm->stripe_id);
+			columnar_bloom_cache_evict_stripe(locator, sm->stripe_id);
 
 			sm->row_count = 0;
 			sm->file_size = 0;
@@ -2290,7 +2381,7 @@ columnar_scan_analyze_next_tuple(TableScanDesc sscan,
 				continue;
 			}
 
-			columnar_populate_slot(slot, &scan->batch_view, row, tupdesc);
+			columnar_populate_slot(slot, &scan->batch_view, row, tupdesc, NULL);
 			ItemPointerSet(&slot->tts_tid,
 						   (BlockNumber) scan->current_stripe,
 						   (OffsetNumber) (row + 1));
@@ -2558,6 +2649,8 @@ columnar_scan_sample_next_tuple(TableScanDesc scan,
  * columnar_pathlist_hook — fired by the planner after standard paths are built.
  * Extracts simple col op const quals, builds a CustomPath that passes them as
  * explicit ScanKeyData to columnar_scan_begin, enabling stripe pruning.
+ * Also adds a custom path for projection pushdown when the query only needs
+ * a subset of the relation's columns (even without any WHERE quals).
  */
 static void
 columnar_pathlist_hook(PlannerInfo *root, RelOptInfo *rel,
@@ -2575,8 +2668,7 @@ columnar_pathlist_hook(PlannerInfo *root, RelOptInfo *rel,
 	if (prev_set_rel_pathlist_hook)
 		prev_set_rel_pathlist_hook(root, rel, rti, rte);
 
-	if (rte->rtekind != RTE_RELATION || rel->baserestrictinfo == NIL ||
-		rel->pathlist == NIL)
+	if (rte->rtekind != RTE_RELATION || rel->pathlist == NIL)
 		return;
 
 	/* Lazy AM OID lookup */
@@ -2690,8 +2782,59 @@ columnar_pathlist_hook(PlannerInfo *root, RelOptInfo *rel,
 		matching_exprs = lappend(matching_exprs, opexpr);
 	}
 
+	/*
+	 * Skip adding a custom path when neither stripe pruning nor projection
+	 * pushdown offers any benefit.  Projection benefit exists when the
+	 * query references fewer columns than the relation has (rel->max_attr
+	 * is the highest attribute number; bms_num_members counts referenced
+	 * columns, so < max_attr means at least one column can be skipped).
+	 * Dropped columns never appear in the target, so this check is
+	 * conservative but harmless.
+	 */
 	if (matching_exprs == NIL)
-		return;
+	{
+		Bitmapset  *needed = NULL;
+		List	   *tvars;
+		int			flags = PVC_RECURSE_AGGREGATES |
+						PVC_RECURSE_WINDOWFUNCS |
+						PVC_RECURSE_PLACEHOLDERS;
+
+		tvars = pull_var_clause((Node *) rel->reltarget->exprs, flags);
+		foreach(lc, tvars)
+		{
+			Var		   *v = lfirst_node(Var, lc);
+
+			if (v->varattno > 0)
+				needed = bms_add_member(needed, v->varattno);
+		}
+		list_free(tvars);
+
+		/* Also account for columns referenced by any WHERE clauses */
+		foreach(lc, rel->baserestrictinfo)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+			tvars = pull_var_clause((Node *) rinfo->clause, flags);
+			ListCell   *lc2;
+
+			foreach(lc2, tvars)
+			{
+				Var		   *v = lfirst_node(Var, lc2);
+
+				if (v->varattno > 0)
+					needed = bms_add_member(needed, v->varattno);
+			}
+			list_free(tvars);
+		}
+
+		if (bms_num_members(needed) >= rel->max_attr)
+		{
+			bms_free(needed);
+			return;				/* all columns needed; no pushdown benefit */
+		}
+		bms_free(needed);
+		/* Fall through: add custom path for projection pushdown. */
+	}
 
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
@@ -2719,19 +2862,19 @@ columnar_pathlist_hook(PlannerInfo *root, RelOptInfo *rel,
 		cpath->path.rows = cheapest->rows;
 		cpath->path.startup_cost = cheapest->startup_cost;
 		/*
-		 * Stripe pruning does at most the same work as a seq scan, so our
-		 * cost is at most equal to the seq scan cost.  A 1-unit reduction
-		 * ensures the planner prefers us over a plain seq scan on ties.
+		 * Cost estimate:
+		 *
+		 * When stripe pruning quals are present, scale by selectivity so
+		 * the planner sees the expected fraction of work.  Floor at 1% so
+		 * we always beat a plain seq scan on ties.
+		 *
+		 * When there are no pruning quals (projection-only path), apply a
+		 * small reduction to ensure we're preferred over the seq scan.
+		 * The actual savings depend on the ratio of referenced columns and
+		 * their types (TEXT/BYTEA savings are larger); 5% is a conservative
+		 * but always-correct lower bound.
 		 */
-
-		/*
-		 * Estimate cost as seq_scan_cost * selectivity.  If the planner
-		 * estimates that the WHERE clause is selective, our stripe-pruning
-		 * scan will be proportionally cheaper (assuming roughly uniform
-		 * distribution of column values across stripes).  Use at least 1%
-		 * of seq_scan cost so add_path always accepts us when there are
-		 * prunable quals.
-		 */
+		if (matching_exprs != NIL)
 		{
 			double		selectivity;
 
@@ -2742,6 +2885,11 @@ columnar_pathlist_hook(PlannerInfo *root, RelOptInfo *rel,
 			selectivity = Max(selectivity, 0.01);	/* floor at 1% */
 			selectivity = Min(selectivity, 0.99);	/* always cheaper than seq scan */
 			cpath->path.total_cost = cheapest->total_cost * selectivity;
+		}
+		else
+		{
+			/* Projection-only: no stripe pruning, but fewer Datums to build */
+			cpath->path.total_cost = cheapest->total_cost * 0.95;
 		}
 	}
 	cpath->path.pathkeys = NIL;
@@ -2812,6 +2960,54 @@ columnar_create_custom_scan_state(CustomScan *cscan)
 	return (Node *) state;
 }
 
+/*
+ * columnar_compute_required_cols
+ *
+ * Walk the custom scan plan's targetlist and row-level quals to collect
+ * the set of 0-based attribute indexes actually referenced by the query.
+ * Returns NULL if no Var references are found (e.g. COUNT(*)), which the
+ * caller treats as "all columns required" for safety.
+ *
+ * This bitmapset is stored on the ColumnarScanDesc so that
+ * columnar_populate_slot can skip materialising columns the executor will
+ * never look at — the key benefit of columnar projection pushdown.
+ */
+static Bitmapset *
+columnar_compute_required_cols(CustomScanState *node)
+{
+	Plan	   *plan = node->ss.ps.plan;
+	Bitmapset  *required = NULL;
+	List	   *vars;
+	ListCell   *lc;
+	int			flags = PVC_RECURSE_AGGREGATES |
+					PVC_RECURSE_WINDOWFUNCS |
+					PVC_RECURSE_PLACEHOLDERS;
+
+	/* Targetlist: columns the parent plan node will consume */
+	vars = pull_var_clause((Node *) plan->targetlist, flags);
+	foreach(lc, vars)
+	{
+		Var		   *var = lfirst_node(Var, lc);
+
+		if (var->varattno > 0)	/* skip system columns */
+			required = bms_add_member(required, var->varattno - 1);
+	}
+	list_free(vars);
+
+	/* Quals: columns needed for row-level filtering after stripe pruning */
+	vars = pull_var_clause((Node *) plan->qual, flags);
+	foreach(lc, vars)
+	{
+		Var		   *var = lfirst_node(Var, lc);
+
+		if (var->varattno > 0)
+			required = bms_add_member(required, var->varattno - 1);
+	}
+	list_free(vars);
+
+	return required;			/* NULL → caller falls back to all-columns */
+}
+
 static void
 columnar_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 {
@@ -2860,6 +3056,14 @@ columnar_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 		table_beginscan(node->ss.ss_currentRelation,
 						estate->es_snapshot,
 						nkeys, nkeys > 0 ? keys : NULL);
+
+	/*
+	 * Projection pushdown: determine which columns this query actually
+	 * needs and store them on the scan descriptor.  columnar_populate_slot
+	 * will skip materialising any column not in this set.
+	 */
+	((ColumnarScanDesc) node->ss.ss_currentScanDesc)->required_cols =
+		columnar_compute_required_cols(node);
 }
 
 /* ExecScanAccessMtd: TupleTableSlot *(*)(ScanState *) — one argument */
@@ -3146,7 +3350,7 @@ columnar_compact_rebuild_indexes(Relation rel,
 
 				ExecClearTuple(slot);
 				columnar_populate_slot(slot, &batch_view, row,
-									   RelationGetDescr(rel));
+									   RelationGetDescr(rel), NULL);
 				ExecStoreVirtualTuple(slot);
 				slot->tts_tid = tid;
 
@@ -3298,7 +3502,7 @@ columnar_compact(PG_FUNCTION_ARGS)
 				continue;
 
 			ExecClearTuple(slot);
-			columnar_populate_slot(slot, &batch_view, row, RelationGetDescr(rel));
+			columnar_populate_slot(slot, &batch_view, row, RelationGetDescr(rel), NULL);
 			ExecStoreVirtualTuple(slot);
 
 			/* columnar_tuple_insert assigns the new TID to slot->tts_tid */
@@ -3355,18 +3559,22 @@ columnar_compact(PG_FUNCTION_ARGS)
 				char	   *ap = columnar_stripe_path(locator, sm->stripe_id);
 				char	   *dp = columnar_deleted_path(locator, sm->stripe_id);
 				char	   *sp = columnar_stats_path(locator, sm->stripe_id);
+				char	   *bp = columnar_bloom_path(locator, sm->stripe_id);
 
 				unlink(ap);
 				unlink(dp);
 				unlink(sp);
+				unlink(bp);		/* optional; ignore if absent */
 				pfree(ap);
 				pfree(dp);
 				pfree(sp);
+				pfree(bp);
 			}
 
 			/* Evict per-stripe caches */
 			columnar_stats_cache_evict_stripe(locator, sm->stripe_id);
 			columnar_bitmap_cache_evict_stripe(locator, sm->stripe_id);
+			columnar_bloom_cache_evict_stripe(locator, sm->stripe_id);
 
 			updated->total_rows -= sm->row_count;
 			sm->row_count = 0;
@@ -3981,6 +4189,7 @@ columnar_rebuild_metadata(PG_FUNCTION_ARGS)
 
 PG_FUNCTION_INFO_V1(columnar_stripe_info);
 PG_FUNCTION_INFO_V1(columnar_cache_stats);
+PG_FUNCTION_INFO_V1(columnar_column_stats);
 
 /*
  * columnar_stripe_info(regclass) -> SETOF record
@@ -3992,6 +4201,7 @@ PG_FUNCTION_INFO_V1(columnar_cache_stats);
  *   compression  text  ('none' | 'lz4' | 'zstd')
  *   deleted_rows int8  (rows with their delete-bitmap bit set)
  *   has_stats    bool  (true when a .stats file exists for this stripe)
+ *   has_bloom    bool  (true when a .bloom file exists for this stripe)
  */
 typedef struct ColumnarStripeInfoCtx
 {
@@ -4048,13 +4258,14 @@ columnar_stripe_info(PG_FUNCTION_ARGS)
 	while (ctx->idx < ctx->meta->num_stripes)
 	{
 		StripeMetadata *sm = &ctx->meta->stripes[ctx->idx++];
-		Datum		values[6];
-		bool		isnull[6] = {false, false, false, false, false, false};
+		Datum		values[7];
+		bool		isnull[7] = {false, false, false, false, false, false, false};
 		HeapTuple	tuple;
 		int64_t		deleted_rows = 0;
 		const char *comp_name;
 		struct stat st_buf;
 		char	   *statspath;
+		char	   *bloompath;
 
 		/* compression label */
 		switch (sm->compression)
@@ -4086,12 +4297,17 @@ columnar_stripe_info(PG_FUNCTION_ARGS)
 		values[5] = BoolGetDatum(stat(statspath, &st_buf) == 0);
 		pfree(statspath);
 
+		/* check for .bloom file */
+		bloompath = columnar_bloom_path(&ctx->locator, sm->stripe_id);
+		values[6] = BoolGetDatum(stat(bloompath, &st_buf) == 0);
+		pfree(bloompath);
+
 		values[0] = Int32GetDatum(sm->stripe_id);
 		values[1] = Int64GetDatum(sm->row_count);
 		values[2] = Int64GetDatum(sm->file_size);
 		values[3] = CStringGetTextDatum(comp_name);
 		values[4] = Int64GetDatum(deleted_rows);
-		/* values[5] already set above */
+		/* values[5] and values[6] already set above */
 
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, isnull);
 		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
@@ -4111,8 +4327,8 @@ Datum
 columnar_cache_stats(PG_FUNCTION_ARGS)
 {
 	TupleDesc		tupdesc;
-	Datum			values[9];
-	bool			isnull[9] = {false};
+	Datum			values[11];
+	bool			isnull[11] = {false};
 	HeapTuple		tuple;
 	ColumnarCacheStats cs;
 
@@ -4123,17 +4339,198 @@ columnar_cache_stats(PG_FUNCTION_ARGS)
 
 	columnar_get_cache_stats(&cs);
 
-	values[0] = Int64GetDatum((int64) cs.metadata_hits);
-	values[1] = Int64GetDatum((int64) cs.metadata_misses);
-	values[2] = Int64GetDatum((int64) cs.stats_hits);
-	values[3] = Int64GetDatum((int64) cs.stats_misses);
-	values[4] = Int64GetDatum((int64) cs.bitmap_hits);
-	values[5] = Int64GetDatum((int64) cs.bitmap_misses);
-	values[6] = Int64GetDatum((int64) cs.ipc_hits);
-	values[7] = Int64GetDatum((int64) cs.ipc_misses);
-	values[8] = Int64GetDatum((int64) cs.ipc_bytes_cached);
+	values[0]  = Int64GetDatum((int64) cs.metadata_hits);
+	values[1]  = Int64GetDatum((int64) cs.metadata_misses);
+	values[2]  = Int64GetDatum((int64) cs.stats_hits);
+	values[3]  = Int64GetDatum((int64) cs.stats_misses);
+	values[4]  = Int64GetDatum((int64) cs.bitmap_hits);
+	values[5]  = Int64GetDatum((int64) cs.bitmap_misses);
+	values[6]  = Int64GetDatum((int64) cs.ipc_hits);
+	values[7]  = Int64GetDatum((int64) cs.ipc_misses);
+	values[8]  = Int64GetDatum((int64) cs.ipc_bytes_cached);
+	values[9]  = Int64GetDatum((int64) cs.bloom_hits);
+	values[10] = Int64GetDatum((int64) cs.bloom_misses);
 
 	tupdesc = BlessTupleDesc(tupdesc);
 	tuple   = heap_form_tuple(tupdesc, values, isnull);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+/*
+ * columnar_column_stats(regclass) -> SETOF record
+ *
+ * Returns one row per (stripe, non-dropped column) with:
+ *   stripe_id  int4
+ *   attnum     int4   (1-based attribute number)
+ *   col_name   text
+ *   stat_type  text   ('none' | 'int' | 'float')
+ *   has_stats  bool   (false when column is all-NULL in that stripe)
+ *   min_value  text   (NULL when stat_type='none' or has_stats=false)
+ *   max_value  text   (NULL when stat_type='none' or has_stats=false)
+ */
+typedef struct ColumnarColumnStatsCtx
+{
+	ColumnarMetadata   *meta;
+	RelFileLocator		locator;
+	TupleDesc			rel_tupdesc;  /* relation's tuple descriptor */
+	int					ncols;        /* number of non-dropped attributes */
+	int					stripe_idx;   /* current stripe (0-based into meta->stripes) */
+	int					attr_idx;     /* current attribute (0-based, may be dropped) */
+	/* arrow_col is recomputed each time from attr_idx by counting non-dropped attrs */
+} ColumnarColumnStatsCtx;
+
+Datum
+columnar_column_stats(PG_FUNCTION_ARGS)
+{
+	FuncCallContext        *funcctx;
+	ColumnarColumnStatsCtx *ctx;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		MemoryContext	oldctx;
+		Oid				relOid = PG_GETARG_OID(0);
+		Relation		rel;
+		TupleDesc		out_tupdesc;
+		TupleDesc		rtdesc;
+		int				i;
+		int				ncols = 0;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+		oldctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		rel = table_open(relOid, AccessShareLock);
+		if (rel->rd_rel->relam != get_columnar_am_oid())
+		{
+			table_close(rel, AccessShareLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("relation \"%s\" is not a columnar table",
+							RelationGetRelationName(rel))));
+		}
+
+		rtdesc = RelationGetDescr(rel);
+		for (i = 0; i < rtdesc->natts; i++)
+			if (!TupleDescAttr(rtdesc, i)->attisdropped)
+				ncols++;
+
+		ctx = palloc0(sizeof(ColumnarColumnStatsCtx));
+		ctx->locator      = *RelationGetLocator(rel);
+		ctx->meta         = columnar_read_metadata(&ctx->locator);
+		ctx->rel_tupdesc  = CreateTupleDescCopy(rtdesc);
+		ctx->ncols        = ncols;
+		ctx->stripe_idx   = 0;
+		ctx->attr_idx     = 0;
+		table_close(rel, AccessShareLock);
+
+		if (get_call_result_type(fcinfo, NULL, &out_tupdesc) != TYPEFUNC_COMPOSITE)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("columnar_column_stats must be called as a set-returning function")));
+
+		funcctx->tuple_desc = BlessTupleDesc(out_tupdesc);
+		funcctx->user_fctx  = ctx;
+		MemoryContextSwitchTo(oldctx);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	ctx = (ColumnarColumnStatsCtx *) funcctx->user_fctx;
+
+	while (ctx->stripe_idx < ctx->meta->num_stripes)
+	{
+		StripeMetadata		*sm = &ctx->meta->stripes[ctx->stripe_idx];
+		TupleDesc			 tdesc = ctx->rel_tupdesc;
+		Form_pg_attribute	 attr;
+		ColumnarStripeStats *stats;
+		ColumnarColumnStats *cs = NULL;
+		const char		    *stat_type_str;
+		Datum				 values[7];
+		bool				 isnull[7] = {false};
+		HeapTuple			 tuple;
+		char				 buf[64];
+		int					 arrow_col;
+		int					 i;
+
+		/* Skip dropped attributes; advance to next stripe when exhausted */
+		while (ctx->attr_idx < tdesc->natts &&
+			   TupleDescAttr(tdesc, ctx->attr_idx)->attisdropped)
+			ctx->attr_idx++;
+
+		if (ctx->attr_idx >= tdesc->natts)
+		{
+			ctx->stripe_idx++;
+			ctx->attr_idx = 0;
+			continue;
+		}
+
+		attr = TupleDescAttr(tdesc, ctx->attr_idx);
+
+		/*
+		 * Compute arrow_col: count non-dropped attrs before attr_idx.
+		 * This avoids storing arrow_col across SRF calls.
+		 */
+		arrow_col = 0;
+		for (i = 0; i < ctx->attr_idx; i++)
+			if (!TupleDescAttr(tdesc, i)->attisdropped)
+				arrow_col++;
+
+		/*
+		 * Load stripe stats fresh from cache each call.
+		 * The cache makes this cheap (one palloc + memcpy); the returned
+		 * pointer lives in CurrentMemoryContext (multi_call_memory_ctx)
+		 * for the duration of this call only — we pfree it before returning.
+		 */
+		stats = columnar_read_stripe_stats(&ctx->locator, sm->stripe_id, ctx->ncols);
+
+		if (stats != NULL && arrow_col < stats->ncols)
+			cs = &stats->cols[arrow_col];
+
+		if (cs == NULL || cs->stat_type == COLUMNAR_STAT_TYPE_NONE)
+			stat_type_str = "none";
+		else if (cs->stat_type == COLUMNAR_STAT_TYPE_INT)
+			stat_type_str = "int";
+		else
+			stat_type_str = "float";
+
+		values[0] = Int32GetDatum(sm->stripe_id);
+		values[1] = Int32GetDatum((int32) (ctx->attr_idx + 1));
+		values[2] = CStringGetTextDatum(NameStr(attr->attname));
+		values[3] = CStringGetTextDatum(stat_type_str);
+
+		if (cs != NULL && cs->stat_type != COLUMNAR_STAT_TYPE_NONE && cs->has_stats)
+		{
+			values[4] = BoolGetDatum(true);
+			if (cs->stat_type == COLUMNAR_STAT_TYPE_INT)
+			{
+				snprintf(buf, sizeof(buf), "%lld", (long long) cs->min_int);
+				values[5] = CStringGetTextDatum(buf);
+				snprintf(buf, sizeof(buf), "%lld", (long long) cs->max_int);
+				values[6] = CStringGetTextDatum(buf);
+			}
+			else
+			{
+				snprintf(buf, sizeof(buf), "%.17g", cs->min_float);
+				values[5] = CStringGetTextDatum(buf);
+				snprintf(buf, sizeof(buf), "%.17g", cs->max_float);
+				values[6] = CStringGetTextDatum(buf);
+			}
+		}
+		else
+		{
+			values[4] = BoolGetDatum(false);
+			isnull[5] = true;
+			isnull[6] = true;
+		}
+
+		/* Free the per-call stats copy before advancing state */
+		if (stats != NULL)
+			columnar_free_stripe_stats(stats);
+
+		/* Advance to next attribute */
+		ctx->attr_idx++;
+
+		tuple = heap_form_tuple(funcctx->tuple_desc, values, isnull);
+		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
+	}
+
+	SRF_RETURN_DONE(funcctx);
 }

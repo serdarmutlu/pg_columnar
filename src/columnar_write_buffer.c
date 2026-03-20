@@ -211,8 +211,24 @@ columnar_flush_write_buffer(ColumnarWriteBuffer *buf)
 						arrow_error.message)));
 
 
-	/* Write the stripe to disk */
-	columnar_write_stripe(&buf->locator, &buf->schema, &batch_view, buf->nrows);
+	/* Build col_types array (one PG OID per Arrow schema child) */
+	{
+		Oid		   *col_types = palloc(sizeof(Oid) * buf->natts);
+		int			ncol_types = 0;
+		int			ci;
+
+		for (ci = 0; ci < buf->natts; ci++)
+		{
+			if (buf->columns[ci].pg_type == InvalidOid)
+				continue;		/* dropped column */
+			col_types[ncol_types++] = buf->columns[ci].pg_type;
+		}
+
+		/* Write the stripe to disk */
+		columnar_write_stripe(&buf->locator, &buf->schema, &batch_view,
+							  buf->nrows, col_types, ncol_types);
+		pfree(col_types);
+	}
 
 
 	/* Clean up */

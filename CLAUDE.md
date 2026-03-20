@@ -266,6 +266,38 @@ from disk (cache miss), subsequent DELETEs in that session read from the cache.
 - DELETE-heavy workloads: only the first DELETE per stripe per session hits disk for
   the read; all subsequent DELETEs in the same session skip the read entirely.
 
+### Level 5 — Projection Pushdown (implemented)
+
+When a query only references a subset of a table's columns (e.g. `SELECT SUM(amount) FROM wide_table`),
+`columnar_populate_slot` skips the Datum materialisation for unreferenced columns instead of
+palloc'ing + memcpy'ing every value into the slot.
+
+**Mechanism:**
+- `ColumnarScanDescData` gains a `Bitmapset *required_cols` field (NULL = all columns, the safe
+  default used by index fetch, ANALYZE, and compaction).
+- `columnar_compute_required_cols(CustomScanState *)` walks `plan->targetlist` and `plan->qual`
+  via `pull_var_clause` to collect the 0-based attribute indexes the query actually needs.
+- `columnar_begin_custom_scan` calls the helper immediately after `table_beginscan` and stores
+  the result on the scan descriptor.
+- `columnar_populate_slot` and the inline write-buffer reader both check `required_cols`:
+  skipped columns are set to `(tts_isnull=true, tts_values=0)` without touching Arrow data;
+  `child_idx` is still advanced to keep schema alignment correct.
+- The `columnar_pathlist_hook` is extended to add a custom path even when there are **no
+  stripe-pruning quals**, provided the query references fewer columns than `rel->max_attr`.
+  This ensures projection fires for `SELECT col1, col2 FROM wide_table` without any WHERE clause.
+  Cost = `cheapest * 0.95` for projection-only; `cheapest * selectivity` when pruning is also active.
+- All non-scan callers of `columnar_populate_slot` (index fetch, ANALYZE, compaction) pass
+  `NULL` for `required_cols` to get full-column reads as before.
+
+**Benefit:** On a 11-column table (1 numeric + 9 TEXT + 1 numeric) with 100K rows, a
+`SUM(amount)` query projecting 2 of 11 columns runs ~36% faster than reading all columns
+(~7ms vs ~11ms warm-cache), and is ~22% faster than the equivalent heap query (~9ms).
+The saving is proportional to the number and size of skipped TEXT/BYTEA/NUMERIC columns.
+
+**Limitation:** Fixed-size types (INT, FLOAT, DATE, TIMESTAMP, BOOL) cost almost nothing to
+materialise even when not needed (just an array index read), so the speedup is most visible
+on tables with many variable-length columns.
+
 ### Level 4 — Columnar Buffer Pool (planned)
 
 Custom scan node + shared stripe RecordBatch cache.  Supersedes Level 2 (shared stripe
@@ -770,6 +802,89 @@ and sscanf then encounters a format/input mismatch (`.a` vs `.d`) but has alread
 assigned `sid=1` — so it returns 1, not 0.  This caused `.deleted` and `.stats` files to
 be counted as duplicate stripes with the same stripe ID, inflating `n_out`.
 The fix is the explicit suffix test before `sscanf`.
+
+---
+
+## Phase 5 — Stripe Inspection SQL Functions
+
+Three SQL-callable functions for inspecting columnar table internals: stripe metadata,
+cache statistics, and per-column min/max statistics.
+
+### `columnar_stripe_info(regclass)`
+
+Returns one row per stripe with 7 output columns:
+
+| Column | Type | Description |
+|---|---|---|
+| `stripe_id` | int | 1-based stripe index |
+| `row_count` | bigint | Total rows in stripe (0 = fully vacuumed) |
+| `file_size` | bigint | On-disk size of `.arrow` file in bytes |
+| `compression` | text | Compression algorithm (`none`, `lz4`, `zstd`) |
+| `deleted_rows` | bigint | Logically deleted rows in this stripe |
+| `has_stats` | bool | Whether a `.stats` min/max file exists |
+| `has_bloom` | bool | Whether a `.bloom` filter file exists |
+
+`has_bloom` added in Phase 5 (presence check via `stat()` on `stripe_XXXXXX.bloom`).
+
+```sql
+SELECT * FROM columnar_stripe_info('orders_columnar');
+```
+
+### `columnar_cache_stats()`
+
+Returns a single record with 11 cumulative hit/miss counters for the current backend:
+
+| Column | Description |
+|---|---|
+| `metadata_hits` / `metadata_misses` | Backend-local metadata HTAB cache |
+| `stats_hits` / `stats_misses` | Per-stripe `.stats` min/max file cache |
+| `bitmap_hits` / `bitmap_misses` | Per-stripe `.deleted` bitmap cache |
+| `ipc_hits` / `ipc_misses` | Per-stripe decompressed IPC bytes cache |
+| `ipc_bytes_cached` | Bytes currently resident in the IPC cache |
+| `bloom_hits` / `bloom_misses` | Per-stripe `.bloom` filter cache |
+
+`bloom_hits` and `bloom_misses` added in Phase 5.
+
+```sql
+SELECT * FROM columnar_cache_stats();
+```
+
+### `columnar_column_stats(regclass)`
+
+Returns one row per `(stripe, non-dropped column)`:
+
+| Column | Type | Description |
+|---|---|---|
+| `stripe_id` | int | 1-based stripe index |
+| `attnum` | int | 1-based attribute number (matches `pg_attribute.attnum`) |
+| `col_name` | text | Column name |
+| `stat_type` | text | `'none'` (text/bool/uuid/etc.), `'int'`, or `'float'` |
+| `has_stats` | bool | False when column was entirely NULL in this stripe |
+| `min_value` | text | NULL when `stat_type='none'` or `has_stats=false` |
+| `max_value` | text | NULL when `stat_type='none'` or `has_stats=false` |
+
+For `stat_type='int'`: values are raw int64 in PG-epoch units (same as stored in `.stats`
+file — days since 2000-01-01 for DATE, µs since 2000-01-01 for TIMESTAMP).
+For `stat_type='float'`: values are formatted with `%.17g` to preserve full precision.
+
+**Implementation notes:**
+- Uses SRF (`FuncCallContext`) with a stateless per-call design.
+- Context struct stores only `stripe_idx` and `attr_idx` (both advance across calls).
+- Stats are reloaded from the in-memory stats cache on each call (zero file I/O after warm-up).
+- `arrow_col` (index into the stripe's Arrow schema) is computed per call by counting
+  non-dropped attributes before `attr_idx` — not stored in the context.
+- **Critical**: storing `ColumnarStripeStats *` across SRF calls caused a SIGSEGV
+  (memory corruption when palloc reused the freed pointer on the next call). Fix: load
+  fresh from cache on each PERCALL invocation and pfree before `SRF_RETURN_NEXT`.
+
+```sql
+SELECT * FROM columnar_column_stats('orders_columnar');
+-- stripe_id | attnum | col_name | stat_type | has_stats | min_value | max_value
+--         1 |      1 | id       | int       | t         | 1         | 10000
+--         1 |      2 | name     | none      | f         |           |
+--         1 |      3 | score    | float     | t         | 1.5       | 15000.5
+--         1 |      4 | dt       | int       | t         | 8767      | 18766
+```
 
 ---
 
