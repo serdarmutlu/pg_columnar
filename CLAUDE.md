@@ -128,7 +128,7 @@ before the first SET.
 
 ## Caching Architecture
 
-Three caching / optimization levels are fully implemented; a fourth is planned:
+All caching and optimization levels are fully implemented:
 
 ### Level 1 — Backend-local Metadata Cache (implemented)
 
