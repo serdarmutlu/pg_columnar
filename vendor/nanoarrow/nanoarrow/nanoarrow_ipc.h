@@ -23,12 +23,8 @@
 #ifdef NANOARROW_NAMESPACE
 
 #define ArrowIpcCheckRuntime NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcCheckRuntime)
-#define ArrowIpcSharedBufferIsThreadSafe \
-  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcSharedBufferIsThreadSafe)
-#define ArrowIpcSharedBufferInit \
-  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcSharedBufferInit)
-#define ArrowIpcSharedBufferReset \
-  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcSharedBufferReset)
+#define ArrowIpcSharedBufferIsThreadSafe ArrowSharedBufferIsThreadSafe
+#define ArrowIpcSharedBufferInit ArrowSharedBufferInit
 #define ArrowIpcGetZstdDecompressionFunction \
   NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcGetZstdDecompressionFunction)
 #define ArrowIpcGetLZ4DecompressionFunction \
@@ -49,14 +45,25 @@
   NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDecoderDecodeHeader)
 #define ArrowIpcDecoderDecodeSchema \
   NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDecoderDecodeSchema)
+#define ArrowIpcDecoderDecodeSchemaWithDictionaries \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDecoderDecodeSchemaWithDictionaries)
 #define ArrowIpcDecoderDecodeArrayView \
   NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDecoderDecodeArrayView)
+#define ArrowIpcDecoderDecodeArrayViewWithDictionaries \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDecoderDecodeArrayViewWithDictionaries)
 #define ArrowIpcDecoderDecodeArray \
   NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDecoderDecodeArray)
+#define ArrowIpcDecoderDecodeArrayWithDictionaries \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDecoderDecodeArrayWithDictionaries)
 #define ArrowIpcDecoderDecodeArrayFromShared \
   NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDecoderDecodeArrayFromShared)
+#define ArrowIpcDecoderDecodeArrayFromSharedWithDictionaries \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE,                      \
+                   ArrowIpcDecoderDecodeArrayFromSharedWithDictionaries)
 #define ArrowIpcDecoderSetSchema \
   NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDecoderSetSchema)
+#define ArrowIpcDecoderSetSchemaWithDictionaries \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDecoderSetSchemaWithDictionaries)
 #define ArrowIpcDecoderSetEndianness \
   NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDecoderSetEndianness)
 #define ArrowIpcDecoderPeekFooter \
@@ -105,6 +112,36 @@
 #define ArrowIpcFooterReset NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcFooterReset)
 #define ArrowIpcEncoderEncodeFooter \
   NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcEncoderEncodeFooter)
+#define ArrowIpcDictionaryEncodingsInit \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDictionaryEncodingsInit)
+#define ArrowIpcDictionaryEncodingsAppend \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDictionaryEncodingsAppend)
+#define ArrowIpcDictionaryEncodingsAppendSchema \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDictionaryEncodingsAppendSchema)
+#define ArrowIpcDictionaryEncodingsFind \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDictionaryEncodingsFind)
+#define ArrowIpcDictionaryEncodingsFindById \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDictionaryEncodingsFindById)
+#define ArrowIpcDictionaryEncodingsUniqueIds \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDictionaryEncodingsUniqueIds)
+#define ArrowIpcDictionaryEncodingsReset \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDictionaryEncodingsReset)
+#define ArrowIpcDictionariesInit \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDictionariesInit)
+#define ArrowIpcDictionariesFindCurrentValue \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDictionariesFindCurrentValue)
+#define ArrowIpcDictionariesReset \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDictionariesReset)
+#define ArrowIpcDecoderDecodeDictionary \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDecoderDecodeDictionary)
+#define ArrowIpcDecoderDecodeDictionaryFromShared \
+  NANOARROW_SYMBOL(NANOARROW_NAMESPACE, ArrowIpcDecoderDecodeDictionaryFromShared)
+
+#else
+
+// Backward-compatible aliases (non-namespaced builds)
+#define ArrowIpcSharedBufferIsThreadSafe ArrowSharedBufferIsThreadSafe
+#define ArrowIpcSharedBufferInit ArrowSharedBufferInit
 
 #endif
 
@@ -156,11 +193,132 @@ enum ArrowIpcCompressionType {
   NANOARROW_IPC_COMPRESSION_TYPE_ZSTD
 };
 
+/// \brief Dictionary kind enumerator
+enum ArrowIpcDictionaryKind {
+  NANOARROW_IPC_DICTIONARY_KIND_UNINITIALIZED,
+  NANOARROW_IPC_DICTIONARY_KIND_DENSE_ARRAY
+};
+
 /// \brief Feature flag for a stream that uses dictionary replacement
 #define NANOARROW_IPC_FEATURE_DICTIONARY_REPLACEMENT 1
 
 /// \brief Feature flag for a stream that uses compression
 #define NANOARROW_IPC_FEATURE_COMPRESSED_BODY 2
+
+/// \brief Description of an Arrow IPC DictionaryBatch message
+struct ArrowIpcDictionaryBatch {
+  /// \brief The identifier for this dictionary
+  int64_t id;
+  /// \brief If non-zero, values should be appended to the existing dictionary.
+  /// Otherwise, values should replace the existing dictionary.
+  int is_delta;
+};
+
+/// \brief Description of a dictionary-encoded field
+///
+/// This struct is intended to be passed by value; however, its data is invalidated
+/// if the underlying ArrowSchema that contains the dictionary-encoded field is
+/// released.
+struct ArrowIpcDictionaryEncoding {
+  /// \brief A pointer to the ArrowSchema node of the dictionary-encoded field
+  ///
+  /// This is a reference into another object and care must be taken to ensure
+  /// that if that object is copied that the schema pointers are updated
+  /// appropriately.
+  const struct ArrowSchema* schema;
+
+  /// \brief The identifier used that will appear in dictionary batch messages
+  int64_t id;
+
+  /// \brief The dictionary kind
+  ///
+  /// Currently only one dictionary kind is permitted by the Arrow specification
+  /// (DenseArray).
+  enum ArrowIpcDictionaryKind kind;
+};
+
+/// \brief List of ArrowIpcDictionaryEncoding structs
+///
+/// This structure provides a list of dictionary encoded fields extracted
+/// from an ArrowSchema during decoding. Its members refer to pointers
+/// within a specific schema, so care must be taken to keep the schema
+/// containing the pointed-to ArrowSchema fields valid.
+struct ArrowIpcDictionaryEncodings {
+  struct ArrowBuffer encodings;
+};
+
+/// \brief Initialize an ArrowIpcDictionaryEncodings list
+NANOARROW_DLL void ArrowIpcDictionaryEncodingsInit(
+    struct ArrowIpcDictionaryEncodings* dictionary_encodings);
+
+/// \brief Append a given ArrowIpcDictionaryEncoding to this list
+NANOARROW_DLL ArrowErrorCode ArrowIpcDictionaryEncodingsAppend(
+    struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    struct ArrowIpcDictionaryEncoding encoding);
+
+/// \brief Append all dictionaries in schema identified according to a depth-first
+/// recursive search starting at 0
+NANOARROW_DLL ArrowErrorCode ArrowIpcDictionaryEncodingsAppendSchema(
+    struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    const struct ArrowSchema* schema);
+
+/// \brief Resolve a ArrowIpcDictionaryEncoding for a given dictionary encoded field
+///
+/// Returns NULL if the pointed to schema does not match any of the pointed to
+/// schemas contained in this list.
+NANOARROW_DLL const struct ArrowIpcDictionaryEncoding* ArrowIpcDictionaryEncodingsFind(
+    const struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    const struct ArrowSchema* schema);
+
+/// \brief Resolve the first ArrowIpcDictionaryEncoding for a given identifier
+///
+/// Note that there may be multiple dictionary-encoded fields with the same
+/// identifier in a given schema; however, all of them should have an identical
+/// value and index data type.
+///
+/// Returns NULL if id does not refer to any of the encodings in this list.
+NANOARROW_DLL const struct ArrowIpcDictionaryEncoding*
+ArrowIpcDictionaryEncodingsFindById(
+    const struct ArrowIpcDictionaryEncodings* dictionary_encodings, int64_t id);
+
+/// \brief Append a list of unique int64_t identifiers to out
+///
+/// Walk all dictionary encodings in this list to find a set of unique identifiers.
+/// This is primarily for internal use to initialize the ArrowIpcDictionaries but
+/// is exposed for testing purposes.
+NANOARROW_DLL ArrowErrorCode ArrowIpcDictionaryEncodingsUniqueIds(
+    const struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    struct ArrowBuffer* out);
+
+/// \brief Release an encodings list and associated resources
+NANOARROW_DLL void ArrowIpcDictionaryEncodingsReset(
+    struct ArrowIpcDictionaryEncodings* dictionary_encodings);
+
+/// \brief Dictionaries and their current values
+///
+/// This structure is the basis for decoding dictionary batches and decoding
+/// record batch messages where some columns are dictionary-encoded. This
+/// structure stores a dictionary-specific ArrowIpcDecoder for each dictionary
+/// identifier and its last seen value.
+struct ArrowIpcDictionaries {
+  void* private_data;
+};
+
+/// \brief Initialize an ArrowIpcDictionaries
+///
+/// Initialize the structure with the dictionaries from an ArrowIpcDictionaryEncodings.
+NANOARROW_DLL ArrowErrorCode
+ArrowIpcDictionariesInit(struct ArrowIpcDictionaries* dictionaries,
+                         const struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+                         struct ArrowError* error);
+
+/// \brief Find the current value of a dictionary with the given ID as an ArrowArray
+NANOARROW_DLL ArrowErrorCode ArrowIpcDictionariesFindCurrentValue(
+    struct ArrowIpcDictionaries* dictionaries, int64_t id, const struct ArrowArray** out,
+    struct ArrowError* error);
+
+/// \brief Release resources associated with an ArrowIpcDictionaries
+NANOARROW_DLL void ArrowIpcDictionariesReset(struct ArrowIpcDictionaries* dictionaries);
 
 /// \brief Checks the nanoarrow runtime to make sure the run/build versions match
 NANOARROW_DLL ArrowErrorCode ArrowIpcCheckRuntime(struct ArrowError* error);
@@ -176,33 +334,6 @@ static inline enum ArrowIpcEndianness ArrowIpcSystemEndianness(void) {
     return NANOARROW_IPC_ENDIANNESS_BIG;
   }
 }
-
-/// \brief A structure representing a reference-counted buffer that may be passed to
-/// ArrowIpcDecoderDecodeArrayFromShared().
-struct ArrowIpcSharedBuffer {
-  struct ArrowBuffer private_src;
-};
-
-/// \brief Initialize the contents of a ArrowIpcSharedBuffer struct
-///
-/// If NANOARROW_OK is returned, the ArrowIpcSharedBuffer takes ownership of
-/// src.
-NANOARROW_DLL ArrowErrorCode ArrowIpcSharedBufferInit(struct ArrowIpcSharedBuffer* shared,
-                                                      struct ArrowBuffer* src);
-
-/// \brief Release the caller's copy of the shared buffer
-///
-/// When finished, the caller must relinquish its own copy of the shared data
-/// using this function. The original buffer will continue to exist until all
-/// ArrowArray objects that refer to it have also been released.
-NANOARROW_DLL void ArrowIpcSharedBufferReset(struct ArrowIpcSharedBuffer* shared);
-
-/// \brief Check for shared buffer thread safety
-///
-/// Thread-safe shared buffers require C11 and the stdatomic.h header.
-/// If either are unavailable, shared buffers are still possible but
-/// the resulting arrays must not be passed to other threads to be released.
-NANOARROW_DLL int ArrowIpcSharedBufferIsThreadSafe(void);
 
 /// \brief A user-extensible decompressor
 ///
@@ -307,6 +438,9 @@ struct ArrowIpcDecoder {
   /// \brief The number of bytes in the forthcoming body message.
   int64_t body_size_bytes;
 
+  /// \brief The last decoded DictionaryBatch
+  const struct ArrowIpcDictionaryBatch* dictionary;
+
   /// \brief The last decoded Footer
   ///
   /// \warning This API is currently only public for use in integration testing;
@@ -380,6 +514,8 @@ NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderDecodeHeader(struct ArrowIpcDecoder*
 ///
 /// After a successful call to ArrowIpcDecoderDecodeHeader(), retrieve an ArrowSchema.
 /// The caller is responsible for releasing the schema if NANOARROW_OK is returned.
+/// This is equivalent to calling ArrowIpcDecoderDecodeSchemaWithDictionaries() with
+/// dictionaries_out = NULL.
 ///
 /// Returns EINVAL if the decoder did not just decode a schema message or
 /// NANOARROW_OK otherwise.
@@ -387,18 +523,51 @@ NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderDecodeSchema(struct ArrowIpcDecoder*
                                                          struct ArrowSchema* out,
                                                          struct ArrowError* error);
 
+/// \brief Decode an ArrowSchema with dictionary encoding information
+///
+/// After a successful call to ArrowIpcDecoderDecodeHeader(), retrieve an ArrowSchema.
+/// The caller is responsible for releasing the schema if NANOARROW_OK is returned.
+/// Neither out nor dictionaries_out should be initialized; dictionaries_out may be
+/// null to omit exporting dictionary identifiers.
+///
+/// Returns EINVAL if the decoder did not just decode a schema message or
+/// NANOARROW_OK otherwise.
+NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderDecodeSchemaWithDictionaries(
+    struct ArrowIpcDecoder* decoder, struct ArrowSchema* out,
+    struct ArrowIpcDictionaryEncodings* dictionaries_out, struct ArrowError* error);
+
 /// \brief Set the ArrowSchema used to decode future record batch messages
 ///
 /// Prepares the decoder for future record batch messages
-/// of this type. The decoder takes ownership of schema if NANOARROW_OK is returned.
+/// of this type. The decoder does not take ownership of schema.
 /// Note that you must call this explicitly after decoding a
 /// Schema message (i.e., the decoder does not assume that the last-decoded
 /// schema message applies to future record batch messages).
 ///
+/// This is equivalent to calling ArrowIpcDecoderSetSchemaWithDictionaries() with
+/// dictionary_encodings = NULL.
+///
 /// Returns EINVAL if schema validation fails or NANOARROW_OK otherwise.
 NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderSetSchema(struct ArrowIpcDecoder* decoder,
-                                                      struct ArrowSchema* schema,
+                                                      const struct ArrowSchema* schema,
                                                       struct ArrowError* error);
+
+/// \brief Set the ArrowSchema and dictionary encodings used to decode future record batch
+/// messages
+///
+/// Prepares the decoder for future record batch messages
+/// of this type. The decoder does not take ownership of schema.
+/// Note that you must call this explicitly after decoding a
+/// Schema message (i.e., the decoder does not assume that the last-decoded
+/// schema message applies to future record batch messages).
+///
+/// Returns EINVAL if schema validation fails or if the schema contains
+/// dictionary encodings that could not be resolved in the provided
+/// ArrowIpcDictionaryEncodings object, or NANOARROW_OK otherwise.
+NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderSetSchemaWithDictionaries(
+    struct ArrowIpcDecoder* decoder, const struct ArrowSchema* schema,
+    const struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    struct ArrowError* error);
 
 /// \brief Set the endianness used to decode future record batch messages
 ///
@@ -411,7 +580,7 @@ NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderSetSchema(struct ArrowIpcDecoder* de
 NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderSetEndianness(
     struct ArrowIpcDecoder* decoder, enum ArrowIpcEndianness endianness);
 
-/// \brief Decode an ArrowArrayView
+/// \brief Decode an ArrowArrayView with dictionary decoding support
 ///
 /// After a successful call to ArrowIpcDecoderDecodeHeader(), deserialize the content
 /// of body into an internally-managed ArrowArrayView and return it. Note that field index
@@ -423,11 +592,23 @@ NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderSetEndianness(
 /// will not perform any heap allocations; however, the buffers referred to by the
 /// returned ArrowArrayView are only valid as long as the buffer referred to by body stays
 /// valid.
+NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderDecodeArrayViewWithDictionaries(
+    struct ArrowIpcDecoder* decoder, struct ArrowBufferView body, int64_t i,
+    struct ArrowIpcDictionaries* dictionaries, struct ArrowArrayView** out,
+    struct ArrowError* error);
+
+/// \brief Decode an ArrowArrayView without dictionary decoding
+///
+/// After a successful call to ArrowIpcDecoderDecodeHeader(), deserialize the content
+/// of body into an internally-managed ArrowArrayView and return it.
+///
+/// This is equivalent to ArrowIpcDecoderDecodeArrayViewWithDictionaries() passing
+/// dictionaries as NULL.
 NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderDecodeArrayView(
     struct ArrowIpcDecoder* decoder, struct ArrowBufferView body, int64_t i,
     struct ArrowArrayView** out, struct ArrowError* error);
 
-/// \brief Decode an ArrowArray
+/// \brief Decode an ArrowArray with dictionary decoding support
 ///
 /// After a successful call to ArrowIpcDecoderDecodeHeader(), assemble an ArrowArray given
 /// a message body and a field index. Note that field index does not equate to column
@@ -438,21 +619,67 @@ NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderDecodeArrayView(
 /// Returns EINVAL if the decoder did not just decode a record batch message, ENOTSUP
 /// if the message uses features not supported by this library, or or NANOARROW_OK
 /// otherwise.
+NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderDecodeArrayWithDictionaries(
+    struct ArrowIpcDecoder* decoder, struct ArrowBufferView body, int64_t i,
+    struct ArrowIpcDictionaries* dictionaries, struct ArrowArray* out,
+    enum ArrowValidationLevel validation_level, struct ArrowError* error);
+
+/// \brief Decode an ArrowArray without dictionary decoding support
+///
+/// After a successful call to ArrowIpcDecoderDecodeHeader(), assemble an ArrowArray given
+/// a message body and a field index.
+///
+/// This is equivalent to calling ArrowIpcDecoderDecodeArrayWithDictionaries() passing
+/// dictionaries as NULL.
 NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderDecodeArray(
     struct ArrowIpcDecoder* decoder, struct ArrowBufferView body, int64_t i,
     struct ArrowArray* out, enum ArrowValidationLevel validation_level,
     struct ArrowError* error);
 
-/// \brief Decode an ArrowArray from an owned buffer
+/// \brief Decode an ArrowArray from an owned buffer with dictionary decoding support
 ///
 /// This implementation takes advantage of the fact that it can avoid copying individual
-/// buffers. In all cases the caller must ArrowIpcSharedBufferReset() body after one or
+/// buffers. In all cases the caller must ArrowBufferReset() body after one or
 /// more calls to ArrowIpcDecoderDecodeArrayFromShared(). If
-/// ArrowIpcSharedBufferIsThreadSafe() returns 0, out must not be released by another
+/// ArrowSharedBufferIsThreadSafe() returns 0, out must not be released by another
 /// thread.
+NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderDecodeArrayFromSharedWithDictionaries(
+    struct ArrowIpcDecoder* decoder, struct ArrowBuffer* shared, int64_t i,
+    struct ArrowIpcDictionaries* dictionaries, struct ArrowArray* out,
+    enum ArrowValidationLevel validation_level, struct ArrowError* error);
+
+/// \brief Decode an ArrowArray from an owned buffer
+///
+/// Equivalent to calling ArrowIpcDecoderDecodeArrayFromSharedWithDictionaries() with
+/// dictionaries as NULL.
 NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderDecodeArrayFromShared(
-    struct ArrowIpcDecoder* decoder, struct ArrowIpcSharedBuffer* shared, int64_t i,
+    struct ArrowIpcDecoder* decoder, struct ArrowBuffer* shared, int64_t i,
     struct ArrowArray* out, enum ArrowValidationLevel validation_level,
+    struct ArrowError* error);
+
+/// \brief Decode an ArrowArray from a dictionary batch into the given
+/// ArrowIpcDictionaries
+///
+/// After a successful call to ArrowIpcDecoderDecodeHeader(), assemble an ArrowArray given
+/// and place it into out for the decoding of future dictionaries. Note that other
+/// dictionaries in out may be used during the decoding if there are nested dictionaries
+/// in this stream. The decoded value may be obtained with
+/// ArrowIpcDictionariesFindCurrentValue.
+NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderDecodeDictionary(
+    struct ArrowIpcDecoder* decoder, struct ArrowBufferView body,
+    enum ArrowValidationLevel validation_level, struct ArrowIpcDictionaries* out,
+    struct ArrowError* error);
+
+/// \brief Decode an ArrowArray from a dictionary batch from an owned buffer
+///
+/// This implementation takes advantage of the fact that it can avoid copying individual
+/// buffers. In all cases the caller must ArrowBufferReset() body after one or
+/// more calls to ArrowIpcDecoderDecodeArrayFromShared(). If
+/// ArrowSharedBufferIsThreadSafe() returns 0, no batches decoded using out may
+/// be released from another thread.
+NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderDecodeDictionaryFromShared(
+    struct ArrowIpcDecoder* decoder, struct ArrowBuffer* shared,
+    enum ArrowValidationLevel validation_level, struct ArrowIpcDictionaries* out,
     struct ArrowError* error);
 
 /// \brief An user-extensible input data source
@@ -508,7 +735,7 @@ struct ArrowIpcArrayStreamReaderOptions {
   /// (since unreferenced portions of the file are often not loaded into memory) or
   /// (2) if all data from all columns are about to be referenced anyway. When loading
   /// a single field there is probably no advantage to using shared buffers.
-  /// Defaults to the value of ArrowIpcSharedBufferIsThreadSafe().
+  /// Defaults to the value of ArrowSharedBufferIsThreadSafe().
   int use_shared_buffers;
 };
 
@@ -670,6 +897,7 @@ ArrowErrorCode ArrowIpcWriterStartFile(struct ArrowIpcWriter* writer,
 /// Writes the IPC file's footer, footer size, and ending magic.
 NANOARROW_DLL ArrowErrorCode ArrowIpcWriterFinalizeFile(struct ArrowIpcWriter* writer,
                                                         struct ArrowError* error);
+
 /// @}
 
 // Internal APIs:
@@ -695,10 +923,14 @@ struct ArrowIpcFileBlock {
 /// This structure is intended to be allocated by the caller, initialized using
 /// ArrowIpcFooterInit(), and released with ArrowIpcFooterReset().
 struct ArrowIpcFooter {
-  /// \brief the Footer's embedded Schema
+  /// \brief The Footer's embedded Schema
   struct ArrowSchema schema;
+  /// \brief Dictionaries present in the footer Schema
+  struct ArrowIpcDictionaryEncodings dictionaries;
   /// \brief all blocks containing RecordBatch Messages
   struct ArrowBuffer record_batch_blocks;
+  /// \brief all blocks containing DictionaryBatch Messages
+  struct ArrowBuffer dictionary_blocks;
 };
 
 /// \brief Initialize a footer

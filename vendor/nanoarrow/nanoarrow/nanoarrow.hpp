@@ -98,9 +98,9 @@ class Exception : public std::exception {
   } while (0)
 #endif
 
-#define NANOARROW_THROW_NOT_OK(EXPR)                                                   \
-  _NANOARROW_THROW_NOT_OK_IMPL(_NANOARROW_MAKE_NAME(errno_status_, __COUNTER__), EXPR, \
-                               #EXPR)
+#define NANOARROW_THROW_NOT_OK(EXPR) \
+  _NANOARROW_THROW_NOT_OK_IMPL(      \
+      _NANOARROW_MAKE_NAME(errno_status_, _NANOARROW_UNIQUE_SUFFIX), EXPR, #EXPR)
 
 /// @}
 
@@ -861,7 +861,7 @@ class ViewArrayAs {
   using const_iterator = typename internal::RandomAccessRange<Get>::const_iterator;
   const_iterator begin() const { return range_.begin(); }
   const_iterator end() const { return range_.end(); }
-  value_type operator[](int64_t i) const { return range_.get(i); }
+  value_type operator[](int64_t i) const { return range_.get(range_.offset + i); }
 };
 
 /// \brief A range-for compatible wrapper for ArrowArray of binary or utf8
