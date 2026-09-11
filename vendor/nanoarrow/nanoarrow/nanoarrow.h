@@ -27,7 +27,11 @@
   (NANOARROW_VERSION_MAJOR * 10000 + NANOARROW_VERSION_MINOR * 100 + \
    NANOARROW_VERSION_PATCH)
 
-// #define NANOARROW_NAMESPACE YourNamespaceHere
+// pg_columnar: prefix all exported nanoarrow symbols so they cannot collide
+// with another extension in the same backend that links nanoarrow or libarrow
+// (pg_duckdb, arrow_fdw, ADBC).  This is a local modification to the upstream
+// amalgamation and MUST be re-applied whenever the bundle is regenerated.
+#define NANOARROW_NAMESPACE PgColumnar
 
 #if !defined(NANOARROW_CXX_NAMESPACE)
 #define NANOARROW_CXX_NAMESPACE nanoarrow
