@@ -26,22 +26,6 @@ namespace nanoarrow {
 namespace internal {
 
 template <>
-inline void init_pointer(struct ArrowIpcSharedBuffer* data) {
-  init_pointer(&data->private_src);
-}
-
-template <>
-inline void move_pointer(struct ArrowIpcSharedBuffer* src,
-                         struct ArrowIpcSharedBuffer* dst) {
-  move_pointer(&src->private_src, &dst->private_src);
-}
-
-template <>
-inline void release_pointer(struct ArrowIpcSharedBuffer* data) {
-  ArrowIpcSharedBufferReset(data);
-}
-
-template <>
 inline void init_pointer(struct ArrowIpcDecoder* data) {
   data->private_data = nullptr;
 }
@@ -58,6 +42,42 @@ inline void release_pointer(struct ArrowIpcDecoder* data) {
 }
 
 template <>
+inline void init_pointer(struct ArrowIpcDictionaryEncodings* data) {
+  ArrowIpcDictionaryEncodingsInit(data);
+}
+
+template <>
+inline void move_pointer(struct ArrowIpcDictionaryEncodings* src,
+                         struct ArrowIpcDictionaryEncodings* dst) {
+  memcpy(dst, src, sizeof(struct ArrowIpcDictionaryEncodings));
+  ArrowIpcDictionaryEncodingsInit(src);
+}
+
+template <>
+inline void release_pointer(struct ArrowIpcDictionaryEncodings* data) {
+  ArrowIpcDictionaryEncodingsReset(data);
+}
+
+template <>
+inline void init_pointer(struct ArrowIpcDictionaries* data) {
+  data->private_data = nullptr;
+}
+
+template <>
+inline void move_pointer(struct ArrowIpcDictionaries* src,
+                         struct ArrowIpcDictionaries* dst) {
+  memcpy(dst, src, sizeof(struct ArrowIpcDictionaries));
+  src->private_data = nullptr;
+}
+
+template <>
+inline void release_pointer(struct ArrowIpcDictionaries* data) {
+  if (data->private_data != nullptr) {
+    ArrowIpcDictionariesReset(data);
+  }
+}
+
+template <>
 inline void init_pointer(struct ArrowIpcFooter* data) {
   ArrowIpcFooterInit(data);
 }
@@ -66,6 +86,7 @@ template <>
 inline void move_pointer(struct ArrowIpcFooter* src, struct ArrowIpcFooter* dst) {
   ArrowSchemaMove(&src->schema, &dst->schema);
   ArrowBufferMove(&src->record_batch_blocks, &dst->record_batch_blocks);
+  move_pointer(&src->dictionaries, &dst->dictionaries);
 }
 
 template <>
@@ -176,14 +197,17 @@ namespace ipc {
 ///
 /// @{
 
-/// \brief Class wrapping a unique struct ArrowIpcSharedBuffer
-using UniqueSharedBuffer = internal::Unique<struct ArrowIpcSharedBuffer>;
-
 /// \brief Class wrapping a unique struct ArrowIpcDecoder
 using UniqueDecoder = internal::Unique<struct ArrowIpcDecoder>;
 
 /// \brief Class wrapping a unique struct ArrowIpcFooter
 using UniqueFooter = internal::Unique<struct ArrowIpcFooter>;
+
+/// \brief Class wrapping a unique struct ArrowIpcDictionaryEncodings
+using UniqueDictionaryEncodings = internal::Unique<struct ArrowIpcDictionaryEncodings>;
+
+/// \brief Class wrapping a unique struct UniqueDictionaries
+using UniqueDictionaries = internal::Unique<struct ArrowIpcDictionaries>;
 
 /// \brief Class wrapping a unique struct ArrowIpcEncoder
 using UniqueEncoder = internal::Unique<struct ArrowIpcEncoder>;

@@ -189,7 +189,7 @@ static inline int N ## _ ## NK ## _is_present(N ## _table_t t__tmp)\
 __## NS ## field_present(ID, t__tmp)\
 static inline T ## _union_t N ## _ ## NK ## _union(N ## _table_t t__tmp)\
 { T ## _union_t u__tmp = { 0, 0 }; u__tmp.type = N ## _ ## NK ## _type_get(t__tmp);\
-  if (u__tmp.type == 0) return u__tmp; u__tmp.value = N ## _ ## NK ## _get(t__tmp); return u__tmp; }\
+  if (u__tmp.type == 0) { return u__tmp; } u__tmp.value = N ## _ ## NK ## _get(t__tmp); return u__tmp; }\
 static inline NS ## string_t N ## _ ## NK ## _as_string(N ## _table_t t__tmp)\
 { return NS ## string_cast_from_generic(N ## _ ## NK ## _get(t__tmp)); }\
 
@@ -810,7 +810,7 @@ static inline N ## _union_vec_ref_t N ## _vec_clone(NS ## builder_t *B, N ##_uni
   _uvref.type = flatcc_builder_refmap_find(B, vec.type); _uvref.value = flatcc_builder_refmap_find(B, vec.value);\
   _len = N ## _union_vec_len(vec); if (_uvref.type == 0) {\
   _uvref.type = flatcc_builder_refmap_insert(B, vec.type, (flatcc_builder_create_type_vector(B, vec.type, _len))); }\
-  if (_uvref.type == 0) return _ret; if (_uvref.value == 0) {\
+  if (_uvref.type == 0) { return _ret; } if (_uvref.value == 0) {\
   if (flatcc_builder_start_offset_vector(B)) return _ret;\
   for (_i = 0; _i < _len; ++_i) { _uref = N ## _clone(B, N ## _union_vec_at(vec, _i));\
     if (!_uref.value || !(flatcc_builder_offset_vector_push(B, _uref.value))) return _ret; }\
@@ -915,11 +915,11 @@ __flatbuffers_build_offset_vector(NS, NS ## string)
 static inline T *N ## _array_copy(T *p, const T *p2, size_t n)\
 { memcpy(p, p2, n * sizeof(T)); return p; }\
 static inline T *N ## _array_copy_from_pe(T *p, const T *p2, size_t n)\
-{ size_t i; if (NS ## is_native_pe()) memcpy(p, p2, n * sizeof(T)); else\
-  for (i = 0; i < n; ++i) N ## _copy_from_pe(&p[i], &p2[i]); return p; }\
+{ size_t i; if (NS ## is_native_pe()) memcpy(p, p2, n * sizeof(T)); else {\
+  for (i = 0; i < n; ++i) N ## _copy_from_pe(&p[i], &p2[i]); } return p; }\
 static inline T *N ## _array_copy_to_pe(T *p, const T *p2, size_t n)\
-{ size_t i; if (NS ## is_native_pe()) memcpy(p, p2, n * sizeof(T)); else\
-  for (i = 0; i < n; ++i) N ## _copy_to_pe(&p[i], &p2[i]); return p; }
+{ size_t i; if (NS ## is_native_pe()) memcpy(p, p2, n * sizeof(T)); else {\
+  for (i = 0; i < n; ++i) N ## _copy_to_pe(&p[i], &p2[i]); } return p; }
 #define __flatbuffers_define_scalar_primitives(NS, N, T)\
 static inline T *N ## _from_pe(T *p) { return __ ## NS ## from_pe(p, N); }\
 static inline T *N ## _to_pe(T *p) { return __ ## NS ## to_pe(p, N); }\
@@ -1823,8 +1823,8 @@ static inline int org_apache_arrow_flatbuf_MetadataVersion_is_known_value(org_ap
  *       forward compatibility guarantees).
  *   2.  A means of negotiating between a client and server
  *       what features a stream is allowed to use. The enums
- *       values here are intented to represent higher level
- *       features, additional details maybe negotiated
+ *       values here are intended to represent higher level
+ *       features, additional details may be negotiated
  *       with key-value pairs specific to the protocol.
  *
  *  Enums added to this list should be assigned power-of-two values
@@ -2149,7 +2149,7 @@ __flatbuffers_define_scalar_field(0, org_apache_arrow_flatbuf_FixedSizeList, lis
  *  may be set in the metadata for this field.
  *
  *  In a field with Map type, the field has a child Struct field, which then
- *  has two children: key type and the second the value type. The names of the
+ *  has two children: the key type and the value type. The names of the
  *  child fields may be respectively "entries", "key", and "value", but this is
  *  not enforced.
  *
@@ -2320,9 +2320,9 @@ __flatbuffers_table_as_root(org_apache_arrow_flatbuf_RunEndEncoded)
 
 
 /**  Exact decimal value represented as an integer value in two's
- *  complement. Currently only 128-bit (16-byte) and 256-bit (32-byte) integers
- *  are used. The representation uses the endianness indicated
- *  in the Schema. */
+ *  complement. Currently 32-bit (4-byte), 64-bit (8-byte),
+ *  128-bit (16-byte) and 256-bit (32-byte) integers are used.
+ *  The representation uses the endianness indicated in the Schema. */
 struct org_apache_arrow_flatbuf_Decimal_table { uint8_t unused__; };
 
 static inline size_t org_apache_arrow_flatbuf_Decimal_vec_len(org_apache_arrow_flatbuf_Decimal_vec_t vec)
@@ -2335,7 +2335,7 @@ __flatbuffers_table_as_root(org_apache_arrow_flatbuf_Decimal)
 __flatbuffers_define_scalar_field(0, org_apache_arrow_flatbuf_Decimal, precision, flatbuffers_int32, int32_t, INT32_C(0))
 /**  Number of digits after the decimal point "." */
 __flatbuffers_define_scalar_field(1, org_apache_arrow_flatbuf_Decimal, scale, flatbuffers_int32, int32_t, INT32_C(0))
-/**  Number of bits per value. The only accepted widths are 128 and 256.
+/**  Number of bits per value. The accepted widths are 32, 64, 128 and 256.
  *  We use bitWidth for consistency with Int::bitWidth. */
 __flatbuffers_define_scalar_field(2, org_apache_arrow_flatbuf_Decimal, bitWidth, flatbuffers_int32, int32_t, INT32_C(128))
 
@@ -2661,7 +2661,7 @@ __flatbuffers_define_scalar_field(0, org_apache_arrow_flatbuf_DictionaryEncoding
  *  and to avoid uint64 indices unless they are required by an application. */
 __flatbuffers_define_table_field(1, org_apache_arrow_flatbuf_DictionaryEncoding, indexType, org_apache_arrow_flatbuf_Int_table_t, 0)
 /**  By default, dictionaries are not ordered, or the order does not have
- *  semantic meaning. In some statistical, applications, dictionary-encoding
+ *  semantic meaning. In some statistical applications, dictionary-encoding
  *  is used to represent ordered categorical data, and we provide a way to
  *  preserve that metadata here */
 __flatbuffers_define_scalar_field(2, org_apache_arrow_flatbuf_DictionaryEncoding, isOrdered, flatbuffers_bool, flatbuffers_bool_t, UINT8_C(0))
@@ -2678,7 +2678,7 @@ static inline org_apache_arrow_flatbuf_Field_table_t org_apache_arrow_flatbuf_Fi
 __flatbuffers_offset_vec_at(org_apache_arrow_flatbuf_Field_table_t, vec, i, 0)
 __flatbuffers_table_as_root(org_apache_arrow_flatbuf_Field)
 
-/**  Name is not required, in i.e. a List */
+/**  Name is not required (e.g., in a List) */
 __flatbuffers_define_string_field(0, org_apache_arrow_flatbuf_Field, name, 0)
 /**  Whether or not this field can contain nulls. Should be true in general. */
 __flatbuffers_define_scalar_field(1, org_apache_arrow_flatbuf_Field, nullable, flatbuffers_bool, flatbuffers_bool_t, UINT8_C(0))
@@ -5427,7 +5427,7 @@ typedef flatbuffers_uoffset_t *org_apache_arrow_flatbuf_Footer_mutable_vec_t;
 
 
 struct org_apache_arrow_flatbuf_Block {
-    /**  Index to the start of the RecordBlock (note this is past the Message header) */
+    /**  Index to the start of the RecordBatch (note this is past the Message header) */
     alignas(8) int64_t offset;
     /**  Length of the metadata */
     alignas(4) int32_t metaDataLength;
@@ -6235,8 +6235,8 @@ static inline int org_apache_arrow_flatbuf_MetadataVersion_is_known_value(org_ap
  *       forward compatibility guarantees).
  *   2.  A means of negotiating between a client and server
  *       what features a stream is allowed to use. The enums
- *       values here are intented to represent higher level
- *       features, additional details maybe negotiated
+ *       values here are intended to represent higher level
+ *       features, additional details may be negotiated
  *       with key-value pairs specific to the protocol.
  *
  *  Enums added to this list should be assigned power-of-two values
@@ -6561,7 +6561,7 @@ __flatbuffers_define_scalar_field(0, org_apache_arrow_flatbuf_FixedSizeList, lis
  *  may be set in the metadata for this field.
  *
  *  In a field with Map type, the field has a child Struct field, which then
- *  has two children: key type and the second the value type. The names of the
+ *  has two children: the key type and the value type. The names of the
  *  child fields may be respectively "entries", "key", and "value", but this is
  *  not enforced.
  *
@@ -6732,9 +6732,9 @@ __flatbuffers_table_as_root(org_apache_arrow_flatbuf_RunEndEncoded)
 
 
 /**  Exact decimal value represented as an integer value in two's
- *  complement. Currently only 128-bit (16-byte) and 256-bit (32-byte) integers
- *  are used. The representation uses the endianness indicated
- *  in the Schema. */
+ *  complement. Currently 32-bit (4-byte), 64-bit (8-byte),
+ *  128-bit (16-byte) and 256-bit (32-byte) integers are used.
+ *  The representation uses the endianness indicated in the Schema. */
 struct org_apache_arrow_flatbuf_Decimal_table { uint8_t unused__; };
 
 static inline size_t org_apache_arrow_flatbuf_Decimal_vec_len(org_apache_arrow_flatbuf_Decimal_vec_t vec)
@@ -6747,7 +6747,7 @@ __flatbuffers_table_as_root(org_apache_arrow_flatbuf_Decimal)
 __flatbuffers_define_scalar_field(0, org_apache_arrow_flatbuf_Decimal, precision, flatbuffers_int32, int32_t, INT32_C(0))
 /**  Number of digits after the decimal point "." */
 __flatbuffers_define_scalar_field(1, org_apache_arrow_flatbuf_Decimal, scale, flatbuffers_int32, int32_t, INT32_C(0))
-/**  Number of bits per value. The only accepted widths are 128 and 256.
+/**  Number of bits per value. The accepted widths are 32, 64, 128 and 256.
  *  We use bitWidth for consistency with Int::bitWidth. */
 __flatbuffers_define_scalar_field(2, org_apache_arrow_flatbuf_Decimal, bitWidth, flatbuffers_int32, int32_t, INT32_C(128))
 
@@ -7073,7 +7073,7 @@ __flatbuffers_define_scalar_field(0, org_apache_arrow_flatbuf_DictionaryEncoding
  *  and to avoid uint64 indices unless they are required by an application. */
 __flatbuffers_define_table_field(1, org_apache_arrow_flatbuf_DictionaryEncoding, indexType, org_apache_arrow_flatbuf_Int_table_t, 0)
 /**  By default, dictionaries are not ordered, or the order does not have
- *  semantic meaning. In some statistical, applications, dictionary-encoding
+ *  semantic meaning. In some statistical applications, dictionary-encoding
  *  is used to represent ordered categorical data, and we provide a way to
  *  preserve that metadata here */
 __flatbuffers_define_scalar_field(2, org_apache_arrow_flatbuf_DictionaryEncoding, isOrdered, flatbuffers_bool, flatbuffers_bool_t, UINT8_C(0))
@@ -7090,7 +7090,7 @@ static inline org_apache_arrow_flatbuf_Field_table_t org_apache_arrow_flatbuf_Fi
 __flatbuffers_offset_vec_at(org_apache_arrow_flatbuf_Field_table_t, vec, i, 0)
 __flatbuffers_table_as_root(org_apache_arrow_flatbuf_Field)
 
-/**  Name is not required, in i.e. a List */
+/**  Name is not required (e.g., in a List) */
 __flatbuffers_define_string_field(0, org_apache_arrow_flatbuf_Field, name, 0)
 /**  Whether or not this field can contain nulls. Should be true in general. */
 __flatbuffers_define_scalar_field(1, org_apache_arrow_flatbuf_Field, nullable, flatbuffers_bool, flatbuffers_bool_t, UINT8_C(0))
@@ -10236,11 +10236,11 @@ static inline int org_apache_arrow_flatbuf_SparseMatrixCompressedAxis_is_known_v
  *  EXPERIMENTAL: Data structures for sparse tensors
  *  Coordinate (COO) format of sparse tensor index.
  *
- *  COO's index list are represented as a NxM matrix,
+ *  COO's index list is represented as an NxM matrix,
  *  where N is the number of non-zero values,
  *  and M is the number of dimensions of a sparse tensor.
  *
- *  indicesBuffer stores the location and size of the data of this indices
+ *  indicesBuffer stores the location and size of the data of these indices
  *  matrix.  The value type and the stride of the indices matrix is
  *  specified in indicesType and indicesStrides fields.
  *
@@ -10261,7 +10261,7 @@ static inline int org_apache_arrow_flatbuf_SparseMatrixCompressedAxis_is_known_v
  *     [2, 2, 3, 1, 2, 0],
  *     [0, 1, 0, 0, 3, 4]]
  *  ```
- *  When isCanonical is true, the indices is sorted in lexicographical order
+ *  When isCanonical is true, the indices are sorted in lexicographical order
  *  (row-major order), and it does not have duplicated entries.  Otherwise,
  *  the indices may not be sorted, or may have duplicated entries. */
 struct org_apache_arrow_flatbuf_SparseTensorIndexCOO_table { uint8_t unused__; };
@@ -10329,7 +10329,7 @@ __flatbuffers_define_table_field(3, org_apache_arrow_flatbuf_SparseMatrixIndexCS
  *  contains the column indices of the corresponding non-zero values.
  *  The type of index value is long.
  *
- *  For example, the indices of the above X is:
+ *  For example, the indices of the above X are:
  *  ```text
  *    indices(X) = [1, 2, 2, 1, 3, 0, 2, 3, 1].
  *  ```
@@ -10351,7 +10351,7 @@ __flatbuffers_table_as_root(org_apache_arrow_flatbuf_SparseTensorIndexCSF)
  *  CSF index recursively compresses each dimension of a tensor into a set
  *  of prefix trees. Each path from a root to leaf forms one tensor
  *  non-zero index. CSF is implemented with two arrays of buffers and one
- *  arrays of integers.
+ *  array of integers.
  *
  *  For example, let X be a 2x3x4x5 tensor and let it have the following
  *  8 non-zero values:
@@ -10383,7 +10383,7 @@ __flatbuffers_define_table_field(0, org_apache_arrow_flatbuf_SparseTensorIndexCS
  *  and `indptrBuffers[dim][i + 1]` signify a range of nodes in
  *  `indicesBuffers[dim + 1]` who are children of `indicesBuffers[dim][i]` node.
  *
- *  For example, the indptrBuffers for the above X is:
+ *  For example, the indptrBuffers for the above X are:
  *  ```text
  *    indptrBuffer(X) = [
  *                        [0, 2, 3],
@@ -10396,7 +10396,7 @@ __flatbuffers_define_vector_field(1, org_apache_arrow_flatbuf_SparseTensorIndexC
 __flatbuffers_define_table_field(2, org_apache_arrow_flatbuf_SparseTensorIndexCSF, indicesType, org_apache_arrow_flatbuf_Int_table_t, 1)
 /**  indicesBuffers stores values of nodes.
  *  Each tensor dimension corresponds to a buffer in indicesBuffers.
- *  For example, the indicesBuffers for the above X is:
+ *  For example, the indicesBuffers for the above X are:
  *  ```text
  *    indicesBuffer(X) = [
  *                         [0, 1],
@@ -11106,7 +11106,9 @@ __flatbuffers_define_integer_type(org_apache_arrow_flatbuf_BodyCompressionMethod
  *  buffer bytes (and then padding as required by the protocol). The
  *  uncompressed length may be set to -1 to indicate that the data that
  *  follows is not compressed, which can be useful for cases where
- *  compression does not yield appreciable savings. */
+ *  compression does not yield appreciable savings.
+ *  Also, empty buffers can optionally be written out as 0-byte compressed
+ *  buffers, thereby omitting the 8-bytes length header. */
 #define org_apache_arrow_flatbuf_BodyCompressionMethod_BUFFER ((org_apache_arrow_flatbuf_BodyCompressionMethod_enum_t)INT8_C(0))
 
 static inline const char *org_apache_arrow_flatbuf_BodyCompressionMethod_name(org_apache_arrow_flatbuf_BodyCompressionMethod_enum_t value)
@@ -11203,7 +11205,7 @@ __flatbuffers_define_vector_field(2, org_apache_arrow_flatbuf_RecordBatch, buffe
 __flatbuffers_define_table_field(3, org_apache_arrow_flatbuf_RecordBatch, compression, org_apache_arrow_flatbuf_BodyCompression_table_t, 0)
 /**  Some types such as Utf8View are represented using a variable number of buffers.
  *  For each such Field in the pre-ordered flattened logical schema, there will be
- *  an entry in variadicBufferCounts to indicate the number of number of variadic
+ *  an entry in variadicBufferCounts to indicate the number of variadic
  *  buffers which belong to that Field in the current RecordBatch.
  *
  *  For example, the schema
@@ -12389,8 +12391,8 @@ static inline int org_apache_arrow_flatbuf_MetadataVersion_is_known_value(org_ap
  *       forward compatibility guarantees).
  *   2.  A means of negotiating between a client and server
  *       what features a stream is allowed to use. The enums
- *       values here are intented to represent higher level
- *       features, additional details maybe negotiated
+ *       values here are intended to represent higher level
+ *       features, additional details may be negotiated
  *       with key-value pairs specific to the protocol.
  *
  *  Enums added to this list should be assigned power-of-two values
@@ -12715,7 +12717,7 @@ __flatbuffers_define_scalar_field(0, org_apache_arrow_flatbuf_FixedSizeList, lis
  *  may be set in the metadata for this field.
  *
  *  In a field with Map type, the field has a child Struct field, which then
- *  has two children: key type and the second the value type. The names of the
+ *  has two children: the key type and the value type. The names of the
  *  child fields may be respectively "entries", "key", and "value", but this is
  *  not enforced.
  *
@@ -12886,9 +12888,9 @@ __flatbuffers_table_as_root(org_apache_arrow_flatbuf_RunEndEncoded)
 
 
 /**  Exact decimal value represented as an integer value in two's
- *  complement. Currently only 128-bit (16-byte) and 256-bit (32-byte) integers
- *  are used. The representation uses the endianness indicated
- *  in the Schema. */
+ *  complement. Currently 32-bit (4-byte), 64-bit (8-byte),
+ *  128-bit (16-byte) and 256-bit (32-byte) integers are used.
+ *  The representation uses the endianness indicated in the Schema. */
 struct org_apache_arrow_flatbuf_Decimal_table { uint8_t unused__; };
 
 static inline size_t org_apache_arrow_flatbuf_Decimal_vec_len(org_apache_arrow_flatbuf_Decimal_vec_t vec)
@@ -12901,7 +12903,7 @@ __flatbuffers_table_as_root(org_apache_arrow_flatbuf_Decimal)
 __flatbuffers_define_scalar_field(0, org_apache_arrow_flatbuf_Decimal, precision, flatbuffers_int32, int32_t, INT32_C(0))
 /**  Number of digits after the decimal point "." */
 __flatbuffers_define_scalar_field(1, org_apache_arrow_flatbuf_Decimal, scale, flatbuffers_int32, int32_t, INT32_C(0))
-/**  Number of bits per value. The only accepted widths are 128 and 256.
+/**  Number of bits per value. The accepted widths are 32, 64, 128 and 256.
  *  We use bitWidth for consistency with Int::bitWidth. */
 __flatbuffers_define_scalar_field(2, org_apache_arrow_flatbuf_Decimal, bitWidth, flatbuffers_int32, int32_t, INT32_C(128))
 
@@ -13227,7 +13229,7 @@ __flatbuffers_define_scalar_field(0, org_apache_arrow_flatbuf_DictionaryEncoding
  *  and to avoid uint64 indices unless they are required by an application. */
 __flatbuffers_define_table_field(1, org_apache_arrow_flatbuf_DictionaryEncoding, indexType, org_apache_arrow_flatbuf_Int_table_t, 0)
 /**  By default, dictionaries are not ordered, or the order does not have
- *  semantic meaning. In some statistical, applications, dictionary-encoding
+ *  semantic meaning. In some statistical applications, dictionary-encoding
  *  is used to represent ordered categorical data, and we provide a way to
  *  preserve that metadata here */
 __flatbuffers_define_scalar_field(2, org_apache_arrow_flatbuf_DictionaryEncoding, isOrdered, flatbuffers_bool, flatbuffers_bool_t, UINT8_C(0))
@@ -13244,7 +13246,7 @@ static inline org_apache_arrow_flatbuf_Field_table_t org_apache_arrow_flatbuf_Fi
 __flatbuffers_offset_vec_at(org_apache_arrow_flatbuf_Field_table_t, vec, i, 0)
 __flatbuffers_table_as_root(org_apache_arrow_flatbuf_Field)
 
-/**  Name is not required, in i.e. a List */
+/**  Name is not required (e.g., in a List) */
 __flatbuffers_define_string_field(0, org_apache_arrow_flatbuf_Field, name, 0)
 /**  Whether or not this field can contain nulls. Should be true in general. */
 __flatbuffers_define_scalar_field(1, org_apache_arrow_flatbuf_Field, nullable, flatbuffers_bool, flatbuffers_bool_t, UINT8_C(0))
@@ -16495,8 +16497,8 @@ static inline int org_apache_arrow_flatbuf_MetadataVersion_is_known_value(org_ap
  *       forward compatibility guarantees).
  *   2.  A means of negotiating between a client and server
  *       what features a stream is allowed to use. The enums
- *       values here are intented to represent higher level
- *       features, additional details maybe negotiated
+ *       values here are intended to represent higher level
+ *       features, additional details may be negotiated
  *       with key-value pairs specific to the protocol.
  *
  *  Enums added to this list should be assigned power-of-two values
@@ -16821,7 +16823,7 @@ __flatbuffers_define_scalar_field(0, org_apache_arrow_flatbuf_FixedSizeList, lis
  *  may be set in the metadata for this field.
  *
  *  In a field with Map type, the field has a child Struct field, which then
- *  has two children: key type and the second the value type. The names of the
+ *  has two children: the key type and the value type. The names of the
  *  child fields may be respectively "entries", "key", and "value", but this is
  *  not enforced.
  *
@@ -16992,9 +16994,9 @@ __flatbuffers_table_as_root(org_apache_arrow_flatbuf_RunEndEncoded)
 
 
 /**  Exact decimal value represented as an integer value in two's
- *  complement. Currently only 128-bit (16-byte) and 256-bit (32-byte) integers
- *  are used. The representation uses the endianness indicated
- *  in the Schema. */
+ *  complement. Currently 32-bit (4-byte), 64-bit (8-byte),
+ *  128-bit (16-byte) and 256-bit (32-byte) integers are used.
+ *  The representation uses the endianness indicated in the Schema. */
 struct org_apache_arrow_flatbuf_Decimal_table { uint8_t unused__; };
 
 static inline size_t org_apache_arrow_flatbuf_Decimal_vec_len(org_apache_arrow_flatbuf_Decimal_vec_t vec)
@@ -17007,7 +17009,7 @@ __flatbuffers_table_as_root(org_apache_arrow_flatbuf_Decimal)
 __flatbuffers_define_scalar_field(0, org_apache_arrow_flatbuf_Decimal, precision, flatbuffers_int32, int32_t, INT32_C(0))
 /**  Number of digits after the decimal point "." */
 __flatbuffers_define_scalar_field(1, org_apache_arrow_flatbuf_Decimal, scale, flatbuffers_int32, int32_t, INT32_C(0))
-/**  Number of bits per value. The only accepted widths are 128 and 256.
+/**  Number of bits per value. The accepted widths are 32, 64, 128 and 256.
  *  We use bitWidth for consistency with Int::bitWidth. */
 __flatbuffers_define_scalar_field(2, org_apache_arrow_flatbuf_Decimal, bitWidth, flatbuffers_int32, int32_t, INT32_C(128))
 
@@ -17333,7 +17335,7 @@ __flatbuffers_define_scalar_field(0, org_apache_arrow_flatbuf_DictionaryEncoding
  *  and to avoid uint64 indices unless they are required by an application. */
 __flatbuffers_define_table_field(1, org_apache_arrow_flatbuf_DictionaryEncoding, indexType, org_apache_arrow_flatbuf_Int_table_t, 0)
 /**  By default, dictionaries are not ordered, or the order does not have
- *  semantic meaning. In some statistical, applications, dictionary-encoding
+ *  semantic meaning. In some statistical applications, dictionary-encoding
  *  is used to represent ordered categorical data, and we provide a way to
  *  preserve that metadata here */
 __flatbuffers_define_scalar_field(2, org_apache_arrow_flatbuf_DictionaryEncoding, isOrdered, flatbuffers_bool, flatbuffers_bool_t, UINT8_C(0))
@@ -17350,7 +17352,7 @@ static inline org_apache_arrow_flatbuf_Field_table_t org_apache_arrow_flatbuf_Fi
 __flatbuffers_offset_vec_at(org_apache_arrow_flatbuf_Field_table_t, vec, i, 0)
 __flatbuffers_table_as_root(org_apache_arrow_flatbuf_Field)
 
-/**  Name is not required, in i.e. a List */
+/**  Name is not required (e.g., in a List) */
 __flatbuffers_define_string_field(0, org_apache_arrow_flatbuf_Field, name, 0)
 /**  Whether or not this field can contain nulls. Should be true in general. */
 __flatbuffers_define_scalar_field(1, org_apache_arrow_flatbuf_Field, nullable, flatbuffers_bool, flatbuffers_bool_t, UINT8_C(0))
@@ -20496,11 +20498,11 @@ static inline int org_apache_arrow_flatbuf_SparseMatrixCompressedAxis_is_known_v
  *  EXPERIMENTAL: Data structures for sparse tensors
  *  Coordinate (COO) format of sparse tensor index.
  *
- *  COO's index list are represented as a NxM matrix,
+ *  COO's index list is represented as an NxM matrix,
  *  where N is the number of non-zero values,
  *  and M is the number of dimensions of a sparse tensor.
  *
- *  indicesBuffer stores the location and size of the data of this indices
+ *  indicesBuffer stores the location and size of the data of these indices
  *  matrix.  The value type and the stride of the indices matrix is
  *  specified in indicesType and indicesStrides fields.
  *
@@ -20521,7 +20523,7 @@ static inline int org_apache_arrow_flatbuf_SparseMatrixCompressedAxis_is_known_v
  *     [2, 2, 3, 1, 2, 0],
  *     [0, 1, 0, 0, 3, 4]]
  *  ```
- *  When isCanonical is true, the indices is sorted in lexicographical order
+ *  When isCanonical is true, the indices are sorted in lexicographical order
  *  (row-major order), and it does not have duplicated entries.  Otherwise,
  *  the indices may not be sorted, or may have duplicated entries. */
 struct org_apache_arrow_flatbuf_SparseTensorIndexCOO_table { uint8_t unused__; };
@@ -20589,7 +20591,7 @@ __flatbuffers_define_table_field(3, org_apache_arrow_flatbuf_SparseMatrixIndexCS
  *  contains the column indices of the corresponding non-zero values.
  *  The type of index value is long.
  *
- *  For example, the indices of the above X is:
+ *  For example, the indices of the above X are:
  *  ```text
  *    indices(X) = [1, 2, 2, 1, 3, 0, 2, 3, 1].
  *  ```
@@ -20611,7 +20613,7 @@ __flatbuffers_table_as_root(org_apache_arrow_flatbuf_SparseTensorIndexCSF)
  *  CSF index recursively compresses each dimension of a tensor into a set
  *  of prefix trees. Each path from a root to leaf forms one tensor
  *  non-zero index. CSF is implemented with two arrays of buffers and one
- *  arrays of integers.
+ *  array of integers.
  *
  *  For example, let X be a 2x3x4x5 tensor and let it have the following
  *  8 non-zero values:
@@ -20643,7 +20645,7 @@ __flatbuffers_define_table_field(0, org_apache_arrow_flatbuf_SparseTensorIndexCS
  *  and `indptrBuffers[dim][i + 1]` signify a range of nodes in
  *  `indicesBuffers[dim + 1]` who are children of `indicesBuffers[dim][i]` node.
  *
- *  For example, the indptrBuffers for the above X is:
+ *  For example, the indptrBuffers for the above X are:
  *  ```text
  *    indptrBuffer(X) = [
  *                        [0, 2, 3],
@@ -20656,7 +20658,7 @@ __flatbuffers_define_vector_field(1, org_apache_arrow_flatbuf_SparseTensorIndexC
 __flatbuffers_define_table_field(2, org_apache_arrow_flatbuf_SparseTensorIndexCSF, indicesType, org_apache_arrow_flatbuf_Int_table_t, 1)
 /**  indicesBuffers stores values of nodes.
  *  Each tensor dimension corresponds to a buffer in indicesBuffers.
- *  For example, the indicesBuffers for the above X is:
+ *  For example, the indicesBuffers for the above X are:
  *  ```text
  *    indicesBuffer(X) = [
  *                         [0, 1],
@@ -21782,8 +21784,8 @@ static inline int org_apache_arrow_flatbuf_MetadataVersion_is_known_value(org_ap
  *       forward compatibility guarantees).
  *   2.  A means of negotiating between a client and server
  *       what features a stream is allowed to use. The enums
- *       values here are intented to represent higher level
- *       features, additional details maybe negotiated
+ *       values here are intended to represent higher level
+ *       features, additional details may be negotiated
  *       with key-value pairs specific to the protocol.
  *
  *  Enums added to this list should be assigned power-of-two values
@@ -22108,7 +22110,7 @@ __flatbuffers_define_scalar_field(0, org_apache_arrow_flatbuf_FixedSizeList, lis
  *  may be set in the metadata for this field.
  *
  *  In a field with Map type, the field has a child Struct field, which then
- *  has two children: key type and the second the value type. The names of the
+ *  has two children: the key type and the value type. The names of the
  *  child fields may be respectively "entries", "key", and "value", but this is
  *  not enforced.
  *
@@ -22279,9 +22281,9 @@ __flatbuffers_table_as_root(org_apache_arrow_flatbuf_RunEndEncoded)
 
 
 /**  Exact decimal value represented as an integer value in two's
- *  complement. Currently only 128-bit (16-byte) and 256-bit (32-byte) integers
- *  are used. The representation uses the endianness indicated
- *  in the Schema. */
+ *  complement. Currently 32-bit (4-byte), 64-bit (8-byte),
+ *  128-bit (16-byte) and 256-bit (32-byte) integers are used.
+ *  The representation uses the endianness indicated in the Schema. */
 struct org_apache_arrow_flatbuf_Decimal_table { uint8_t unused__; };
 
 static inline size_t org_apache_arrow_flatbuf_Decimal_vec_len(org_apache_arrow_flatbuf_Decimal_vec_t vec)
@@ -22294,7 +22296,7 @@ __flatbuffers_table_as_root(org_apache_arrow_flatbuf_Decimal)
 __flatbuffers_define_scalar_field(0, org_apache_arrow_flatbuf_Decimal, precision, flatbuffers_int32, int32_t, INT32_C(0))
 /**  Number of digits after the decimal point "." */
 __flatbuffers_define_scalar_field(1, org_apache_arrow_flatbuf_Decimal, scale, flatbuffers_int32, int32_t, INT32_C(0))
-/**  Number of bits per value. The only accepted widths are 128 and 256.
+/**  Number of bits per value. The accepted widths are 32, 64, 128 and 256.
  *  We use bitWidth for consistency with Int::bitWidth. */
 __flatbuffers_define_scalar_field(2, org_apache_arrow_flatbuf_Decimal, bitWidth, flatbuffers_int32, int32_t, INT32_C(128))
 
@@ -22620,7 +22622,7 @@ __flatbuffers_define_scalar_field(0, org_apache_arrow_flatbuf_DictionaryEncoding
  *  and to avoid uint64 indices unless they are required by an application. */
 __flatbuffers_define_table_field(1, org_apache_arrow_flatbuf_DictionaryEncoding, indexType, org_apache_arrow_flatbuf_Int_table_t, 0)
 /**  By default, dictionaries are not ordered, or the order does not have
- *  semantic meaning. In some statistical, applications, dictionary-encoding
+ *  semantic meaning. In some statistical applications, dictionary-encoding
  *  is used to represent ordered categorical data, and we provide a way to
  *  preserve that metadata here */
 __flatbuffers_define_scalar_field(2, org_apache_arrow_flatbuf_DictionaryEncoding, isOrdered, flatbuffers_bool, flatbuffers_bool_t, UINT8_C(0))
@@ -22637,7 +22639,7 @@ static inline org_apache_arrow_flatbuf_Field_table_t org_apache_arrow_flatbuf_Fi
 __flatbuffers_offset_vec_at(org_apache_arrow_flatbuf_Field_table_t, vec, i, 0)
 __flatbuffers_table_as_root(org_apache_arrow_flatbuf_Field)
 
-/**  Name is not required, in i.e. a List */
+/**  Name is not required (e.g., in a List) */
 __flatbuffers_define_string_field(0, org_apache_arrow_flatbuf_Field, name, 0)
 /**  Whether or not this field can contain nulls. Should be true in general. */
 __flatbuffers_define_scalar_field(1, org_apache_arrow_flatbuf_Field, nullable, flatbuffers_bool, flatbuffers_bool_t, UINT8_C(0))
@@ -25884,42 +25886,25 @@ ArrowErrorCode ArrowIpcSerialDecompressorSetFunction(
 
 #include <errno.h>
 #include <inttypes.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-
-// For thread safe shared buffers we need C11 + stdatomic.h
-// Can compile with -DNANOARROW_IPC_USE_STDATOMIC=0 or 1 to override
-// automatic detection
-#if !defined(NANOARROW_IPC_USE_STDATOMIC)
-#define NANOARROW_IPC_USE_STDATOMIC 0
-
-// Check for C11
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-
-// Check for GCC 4.8, which doesn't include stdatomic.h but does
-// not define __STDC_NO_ATOMICS__
-#if defined(__clang__) || !defined(__GNUC__) || __GNUC__ >= 5
-
-#if !defined(__STDC_NO_ATOMICS__)
-#include <stdatomic.h>
-#undef NANOARROW_IPC_USE_STDATOMIC
-#define NANOARROW_IPC_USE_STDATOMIC 1
-#endif
-#endif
-#endif
-
-#endif
 
 
 #include "nanoarrow/nanoarrow.h"
 #include "nanoarrow/nanoarrow_ipc.h"
 
-// R 3.6 / Windows builds on a very old toolchain that does not define ENODATA
-#if defined(_WIN32) && !defined(_MSC_VER) && !defined(ENODATA)
+// ENODATA is an XSI extension and is not defined by all libcs (e.g., older
+// Windows/MinGW toolchains used by R 3.6, FreeBSD, and OpenBSD).
+#if !defined(ENODATA)
 #define ENODATA 120
 #endif
 
 #define NANOARROW_IPC_MAGIC "ARROW1"
+
+#define NANOARROW_IPC_NO_DICTIONARY_ID INT64_MIN
+
+#define ns(x) FLATBUFFERS_WRAP_NAMESPACE(org_apache_arrow_flatbuf, x)
 
 // Internal representation of a parsed "Field" from flatbuffers. This
 // represents a field in a depth-first walk of column arrays and their
@@ -25933,6 +25918,9 @@ struct ArrowIpcField {
   struct ArrowArray* array;
   // The cumulative number of buffers preceding this node.
   int64_t buffer_offset;
+  // Dictionary identifier (or NANOARROW_IPC_NO_DICTIONARY_ID if this is not a
+  // dictionary-encoded field)
+  int64_t dictionary_id;
 };
 
 // Internal data specific to the read/decode process
@@ -25962,6 +25950,8 @@ struct ArrowIpcDecoderPrivate {
   int64_t n_union_fields;
   // A pointer to the last flatbuffers message.
   const void* last_message;
+  // Storage for a DictionaryBatch
+  struct ArrowIpcDictionaryBatch dictionary;
   // Storage for a Footer
   struct ArrowIpcFooter footer;
   // Decompressor for compression support
@@ -25969,8 +25959,50 @@ struct ArrowIpcDecoderPrivate {
 };
 
 ArrowErrorCode ArrowIpcCheckRuntime(struct ArrowError* error) {
-  // Avoids an unused warning when bundling the header into nanoarrow_ipc.c
+  // Avoids unused warnings when bundling the header into nanoarrow_ipc.c
   NANOARROW_UNUSED(flatbuffers_end);
+  NANOARROW_UNUSED(flatcc_builder_is_nested);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Null_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Struct__required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_List_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_LargeList_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_ListView_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_LargeListView_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_FixedSizeList_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Map_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Union_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Int_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_FloatingPoint_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Utf8_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Binary_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_LargeUtf8_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_LargeBinary_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Utf8View_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_BinaryView_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_FixedSizeBinary_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Bool_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_RunEndEncoded_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Decimal_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Date_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Time_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Timestamp_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Interval_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Duration_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_KeyValue_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_DictionaryEncoding_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Field_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Schema_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Footer_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_TensorDim_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Tensor_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_SparseTensorIndexCOO_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_SparseMatrixIndexCSX_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_SparseTensorIndexCSF_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_SparseTensor_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_BodyCompression_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_RecordBatch_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_DictionaryBatch_required);
+  NANOARROW_UNUSED(__org_apache_arrow_flatbuf_Message_required);
 
   const char* nanoarrow_runtime_version = ArrowNanoarrowVersion();
   const char* nanoarrow_ipc_build_time_version = NANOARROW_VERSION;
@@ -25984,104 +26016,6 @@ ArrowErrorCode ArrowIpcCheckRuntime(struct ArrowError* error) {
   return NANOARROW_OK;
 }
 
-#if NANOARROW_IPC_USE_STDATOMIC
-struct ArrowIpcSharedBufferPrivate {
-  struct ArrowBuffer src;
-  atomic_long reference_count;
-};
-
-static int64_t ArrowIpcSharedBufferUpdate(
-    struct ArrowIpcSharedBufferPrivate* private_data, int delta) {
-  int64_t old_count = atomic_fetch_add(&private_data->reference_count, delta);
-  return old_count + delta;
-}
-
-static void ArrowIpcSharedBufferSet(struct ArrowIpcSharedBufferPrivate* private_data,
-                                    int64_t count) {
-  atomic_store(&private_data->reference_count, count);
-}
-
-int ArrowIpcSharedBufferIsThreadSafe(void) { return 1; }
-#else
-struct ArrowIpcSharedBufferPrivate {
-  struct ArrowBuffer src;
-  int64_t reference_count;
-};
-
-static int64_t ArrowIpcSharedBufferUpdate(
-    struct ArrowIpcSharedBufferPrivate* private_data, int delta) {
-  private_data->reference_count += delta;
-  return private_data->reference_count;
-}
-
-static void ArrowIpcSharedBufferSet(struct ArrowIpcSharedBufferPrivate* private_data,
-                                    int64_t count) {
-  private_data->reference_count = count;
-}
-
-int ArrowIpcSharedBufferIsThreadSafe(void) { return 0; }
-#endif
-
-static void ArrowIpcSharedBufferFree(struct ArrowBufferAllocator* allocator, uint8_t* ptr,
-                                     int64_t size) {
-  NANOARROW_UNUSED(allocator);
-  NANOARROW_UNUSED(ptr);
-  NANOARROW_UNUSED(size);
-
-  struct ArrowIpcSharedBufferPrivate* private_data =
-      (struct ArrowIpcSharedBufferPrivate*)allocator->private_data;
-
-  if (ArrowIpcSharedBufferUpdate(private_data, -1) == 0) {
-    ArrowBufferReset(&private_data->src);
-    ArrowFree(private_data);
-  }
-}
-
-ArrowErrorCode ArrowIpcSharedBufferInit(struct ArrowIpcSharedBuffer* shared,
-                                        struct ArrowBuffer* src) {
-  if (src->data == NULL) {
-    ArrowBufferMove(src, &shared->private_src);
-    return NANOARROW_OK;
-  }
-
-  struct ArrowIpcSharedBufferPrivate* private_data =
-      (struct ArrowIpcSharedBufferPrivate*)ArrowMalloc(
-          sizeof(struct ArrowIpcSharedBufferPrivate));
-  if (private_data == NULL) {
-    return ENOMEM;
-  }
-
-  ArrowBufferMove(src, &private_data->src);
-  ArrowIpcSharedBufferSet(private_data, 1);
-
-  ArrowBufferInit(&shared->private_src);
-  shared->private_src.data = private_data->src.data;
-  shared->private_src.size_bytes = private_data->src.size_bytes;
-  // Don't expose any extra capcity from src so that any calls to ArrowBufferAppend
-  // on this buffer will fail.
-  shared->private_src.capacity_bytes = private_data->src.size_bytes;
-  shared->private_src.allocator =
-      ArrowBufferDeallocator(&ArrowIpcSharedBufferFree, private_data);
-  return NANOARROW_OK;
-}
-
-static void ArrowIpcSharedBufferClone(struct ArrowIpcSharedBuffer* shared,
-                                      struct ArrowBuffer* shared_out) {
-  if (shared->private_src.size_bytes == 0) {
-    ArrowBufferInit(shared_out);
-    return;
-  }
-
-  struct ArrowIpcSharedBufferPrivate* private_data =
-      (struct ArrowIpcSharedBufferPrivate*)shared->private_src.allocator.private_data;
-  ArrowIpcSharedBufferUpdate(private_data, 1);
-  memcpy(shared_out, shared, sizeof(struct ArrowBuffer));
-}
-
-void ArrowIpcSharedBufferReset(struct ArrowIpcSharedBuffer* shared) {
-  ArrowBufferReset(&shared->private_src);
-}
-
 static int ArrowIpcDecoderNeedsSwapEndian(struct ArrowIpcDecoder* decoder) {
   struct ArrowIpcDecoderPrivate* private_data =
       (struct ArrowIpcDecoderPrivate*)decoder->private_data;
@@ -26093,6 +26027,407 @@ static int ArrowIpcDecoderNeedsSwapEndian(struct ArrowIpcDecoder* decoder) {
     default:
       return 0;
   }
+}
+
+void ArrowIpcDictionaryEncodingsInit(
+    struct ArrowIpcDictionaryEncodings* dictionary_encodings) {
+  NANOARROW_DCHECK(dictionary_encodings != NULL);
+  ArrowBufferInit(&dictionary_encodings->encodings);
+}
+
+ArrowErrorCode ArrowIpcDictionaryEncodingsAppend(
+    struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    struct ArrowIpcDictionaryEncoding encoding) {
+  NANOARROW_DCHECK(dictionary_encodings != NULL);
+  NANOARROW_RETURN_NOT_OK(ArrowBufferAppend(&dictionary_encodings->encodings, &encoding,
+                                            sizeof(struct ArrowIpcDictionaryEncoding)));
+  return NANOARROW_OK;
+}
+
+static ArrowErrorCode ArrowIpcDictionaryEncodingsAppendSchemaInternal(
+    struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    const struct ArrowSchema* schema, int64_t* next_id) {
+  if (schema->dictionary != NULL) {
+    struct ArrowIpcDictionaryEncoding encoding;
+    encoding.schema = schema;
+    encoding.id = (*next_id)++;
+    encoding.kind = NANOARROW_IPC_DICTIONARY_KIND_DENSE_ARRAY;
+    NANOARROW_RETURN_NOT_OK(
+        ArrowIpcDictionaryEncodingsAppend(dictionary_encodings, encoding));
+  }
+
+  for (int64_t i = 0; i < schema->n_children; i++) {
+    NANOARROW_DCHECK(schema->children != NULL && schema->children[i] != NULL);
+    NANOARROW_RETURN_NOT_OK(ArrowIpcDictionaryEncodingsAppendSchemaInternal(
+        dictionary_encodings, schema->children[i], next_id));
+  }
+
+  if (schema->dictionary != NULL) {
+    NANOARROW_RETURN_NOT_OK(ArrowIpcDictionaryEncodingsAppendSchemaInternal(
+        dictionary_encodings, schema->dictionary, next_id));
+  }
+
+  return NANOARROW_OK;
+}
+
+ArrowErrorCode ArrowIpcDictionaryEncodingsAppendSchema(
+    struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    const struct ArrowSchema* schema) {
+  NANOARROW_DCHECK(dictionary_encodings != NULL);
+
+  int64_t next_id = 0;
+  NANOARROW_RETURN_NOT_OK(ArrowIpcDictionaryEncodingsAppendSchemaInternal(
+      dictionary_encodings, schema, &next_id));
+
+  return NANOARROW_OK;
+}
+
+const struct ArrowIpcDictionaryEncoding* ArrowIpcDictionaryEncodingsFind(
+    const struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    const struct ArrowSchema* schema) {
+  NANOARROW_DCHECK(dictionary_encodings != NULL);
+  int64_t length = dictionary_encodings->encodings.size_bytes /
+                   sizeof(struct ArrowIpcDictionaryEncoding);
+  const struct ArrowIpcDictionaryEncoding* data =
+      (const struct ArrowIpcDictionaryEncoding*)dictionary_encodings->encodings.data;
+
+  for (int64_t i = 0; i < length; i++) {
+    const struct ArrowIpcDictionaryEncoding* encoding = data + i;
+    if (encoding->schema == schema) {
+      return encoding;
+    }
+  }
+
+  return NULL;
+}
+
+const struct ArrowIpcDictionaryEncoding* ArrowIpcDictionaryEncodingsFindById(
+    const struct ArrowIpcDictionaryEncodings* dictionary_encodings, int64_t id) {
+  NANOARROW_DCHECK(dictionary_encodings != NULL);
+  int64_t length = dictionary_encodings->encodings.size_bytes /
+                   sizeof(struct ArrowIpcDictionaryEncoding);
+  const struct ArrowIpcDictionaryEncoding* data =
+      (const struct ArrowIpcDictionaryEncoding*)dictionary_encodings->encodings.data;
+
+  for (int64_t i = 0; i < length; i++) {
+    const struct ArrowIpcDictionaryEncoding* encoding = data + i;
+    if (encoding->id == id) {
+      return encoding;
+    }
+  }
+
+  return NULL;
+}
+
+static int ArrowIpcIdsListContains(const struct ArrowBuffer* ids_buffer, int64_t num_ids,
+                                   int64_t id) {
+  const int64_t* ids = (const int64_t*)ids_buffer->data;
+  for (int64_t i = 0; i < num_ids; i++) {
+    if (ids[i] == id) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+ArrowErrorCode ArrowIpcDictionaryEncodingsUniqueIds(
+    const struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    struct ArrowBuffer* out) {
+  NANOARROW_DCHECK(dictionary_encodings != NULL);
+  int64_t length = dictionary_encodings->encodings.size_bytes /
+                   sizeof(struct ArrowIpcDictionaryEncoding);
+  const struct ArrowIpcDictionaryEncoding* data =
+      (const struct ArrowIpcDictionaryEncoding*)dictionary_encodings->encodings.data;
+
+  struct ArrowBuffer tmp;
+  ArrowBufferInit(&tmp);
+
+  ArrowErrorCode result;
+  int64_t num_ids = 0;
+  for (int64_t i = 0; i < length; i++) {
+    const struct ArrowIpcDictionaryEncoding* encoding = data + i;
+    if (!ArrowIpcIdsListContains(&tmp, num_ids, encoding->id)) {
+      result = ArrowBufferAppendInt64(&tmp, encoding->id);
+      if (result != NANOARROW_OK) {
+        ArrowBufferReset(&tmp);
+        return result;
+      }
+
+      ++num_ids;
+    }
+  }
+
+  ArrowBufferMove(&tmp, out);
+  return NANOARROW_OK;
+}
+
+void ArrowIpcDictionaryEncodingsReset(
+    struct ArrowIpcDictionaryEncodings* dictionary_encodings) {
+  NANOARROW_DCHECK(dictionary_encodings != NULL);
+  ArrowBufferReset(&dictionary_encodings->encodings);
+}
+
+/// \brief Internal member of an ArrowIpcDictionaries
+///
+/// This structure stores a dictionary-specific decoder and the current value
+/// of the dictionary (if one exists).
+struct ArrowIpcDictionary {
+  int64_t id;
+  struct ArrowIpcDecoder decoder;
+  struct ArrowArray current_value;
+};
+
+static ArrowErrorCode ArrowIpcDictionaryInit(struct ArrowIpcDictionary* dictionary) {
+  dictionary->id = NANOARROW_IPC_NO_DICTIONARY_ID;
+  NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderInit(&dictionary->decoder));
+  memset(&dictionary->current_value, 0, sizeof(struct ArrowArray));
+  return NANOARROW_OK;
+}
+
+static ArrowErrorCode ArrowIpcDictionaryReplace(struct ArrowIpcDictionary* dictionary,
+                                                struct ArrowArray* value,
+                                                struct ArrowError* error) {
+  NANOARROW_UNUSED(error);
+
+  if (dictionary->current_value.release != NULL) {
+    ArrowArrayRelease(&dictionary->current_value);
+  }
+
+  // Convert to a shared array so that clones can reference the same data
+  // without copying
+  struct ArrowArray shared;
+  NANOARROW_RETURN_NOT_OK(ArrowArrayMoveShared(value, &shared));
+  ArrowArrayMove(&shared, &dictionary->current_value);
+  return NANOARROW_OK;
+}
+
+static ArrowErrorCode ArrowIpcDictionaryAppend(struct ArrowIpcDictionary* dictionary,
+                                               struct ArrowArray* value,
+                                               struct ArrowError* error) {
+  if (dictionary->current_value.release != NULL &&
+      dictionary->current_value.length != 0) {
+    ArrowErrorSet(error, "Dictionary concatenation is not yet supported");
+    return ENOTSUP;
+  }
+
+  NANOARROW_RETURN_NOT_OK(ArrowIpcDictionaryReplace(dictionary, value, error));
+  return NANOARROW_OK;
+}
+
+static void ArrowIpcDictionaryReset(struct ArrowIpcDictionary* dictionary) {
+  ArrowIpcDecoderReset(&dictionary->decoder);
+  if (dictionary->current_value.release) {
+    ArrowArrayRelease(&dictionary->current_value);
+  }
+}
+
+struct ArrowIpcDictionariesPrivate {
+  struct ArrowIpcDictionary* dictionaries;
+  int64_t num_dictionaries;
+};
+
+static void ArrowIpcDictionariesNoOpSchemaRelease(struct ArrowSchema* schema) {
+  NANOARROW_UNUSED(schema);
+}
+
+static ArrowErrorCode ArrowIpcDictionariesInitDictionaries(
+    struct ArrowIpcDictionariesPrivate* private_data,
+    const struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    const struct ArrowBuffer* unique_ids_buffer, int64_t* num_initialized_decoders_out,
+    struct ArrowError* error) {
+  ArrowErrorCode result;
+  const int64_t* unique_ids = (const int64_t*)unique_ids_buffer->data;
+
+  // To set the schema of each ArrowIpcDictionary's encoder, we need to construct a
+  // const ArrowSchema* that points to a struct with exactly one child that is the
+  // value type. To support nested dictionaries that may exist within
+  // ArrowIpcDictionaryEncodings, we can't deep copy the value type because it would
+  // invalidate pointer references within dictionary_encodings (i.e., nested dictionaries
+  // would fail to resolve when we call ArrowIpcDecoderSetSchemaWithDictionaries()).
+  // To make this work, we create an ArrowSchema with a noop release to pass to
+  // ArrowIpcDecoderSetSchemaWithDictionaries(). This works because that function
+  // accepts a const value (i.e., never releases the schema argument).
+  struct ArrowSchema decoder_schema;
+  memset(&decoder_schema, 0, sizeof(struct ArrowSchema));
+  decoder_schema.name = "";
+  decoder_schema.format = "+s";
+  decoder_schema.n_children = 1;
+  decoder_schema.release = &ArrowIpcDictionariesNoOpSchemaRelease;
+
+  for (int64_t i = 0; i < private_data->num_dictionaries; i++) {
+    struct ArrowIpcDictionary* dictionary = private_data->dictionaries + i;
+    result = ArrowIpcDictionaryInit(dictionary);
+    if (result != NANOARROW_OK) {
+      ArrowErrorSet(error, "Internal error (failed to initialize dictionary)");
+      *num_initialized_decoders_out = i;
+      return result;
+    }
+
+    const struct ArrowIpcDictionaryEncoding* encoding =
+        ArrowIpcDictionaryEncodingsFindById(dictionary_encodings, unique_ids[i]);
+    if (encoding == NULL) {
+      ArrowErrorSet(error,
+                    "Internal error (dictionary with id not present in encodings list)");
+      *num_initialized_decoders_out = i + 1;
+      return EINVAL;
+    }
+
+    // The decoder's schema will be a struct with one column (the value type of
+    // the dictionary-encoded field)
+    decoder_schema.children = (struct ArrowSchema**)&encoding->schema->dictionary;
+
+    result = ArrowIpcDecoderSetSchemaWithDictionaries(
+        &dictionary->decoder, &decoder_schema, dictionary_encodings, error);
+    if (result != NANOARROW_OK) {
+      *num_initialized_decoders_out = i + 1;
+      return result;
+    }
+
+    // Set the ID
+    dictionary->id = unique_ids[i];
+
+    // Set the initial array value to a valid array with zero length. This is
+    // needed because empty and/or all null columns may not have a dictionary
+    // message emitted before a record batch arrives.
+    struct ArrowArray initial_value;
+    result =
+        ArrowArrayInitFromSchema(&initial_value, encoding->schema->dictionary, error);
+    if (result != NANOARROW_OK) {
+      *num_initialized_decoders_out = i + 1;
+      return result;
+    }
+
+    result = ArrowArrayFinishBuildingDefault(&initial_value, error);
+    if (result != NANOARROW_OK) {
+      ArrowArrayRelease(&initial_value);
+      *num_initialized_decoders_out = i + 1;
+      return result;
+    }
+
+    // Convert to a shared array so that clones can reference the same data
+    // without copying
+    result = ArrowArrayMoveShared(&initial_value, &dictionary->current_value);
+    if (result != NANOARROW_OK) {
+      ArrowArrayRelease(&initial_value);
+      *num_initialized_decoders_out = i + 1;
+      return result;
+    }
+  }
+
+  *num_initialized_decoders_out = private_data->num_dictionaries;
+  return NANOARROW_OK;
+}
+
+ArrowErrorCode ArrowIpcDictionariesInit(
+    struct ArrowIpcDictionaries* dictionaries,
+    const struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    struct ArrowError* error) {
+  NANOARROW_DCHECK(dictionaries != NULL);
+  NANOARROW_DCHECK(dictionary_encodings != NULL);
+
+  memset(dictionaries, 0, sizeof(struct ArrowIpcDictionaries));
+  struct ArrowIpcDictionariesPrivate* private_data =
+      (struct ArrowIpcDictionariesPrivate*)ArrowMalloc(
+          sizeof(struct ArrowIpcDictionariesPrivate));
+  if (private_data == NULL) {
+    ArrowErrorSet(error, "Failed to allocate ArrowIpcDictionariesPrivate");
+    return ENOMEM;
+  }
+
+  // Count the number of unique IDs. This will usually be the number of dictionary
+  // encodings but may be much smaller if there are a lot of dictionary encoded fields
+  // that use the same dictionary.
+  struct ArrowBuffer unique_ids;
+  ArrowErrorCode result =
+      ArrowIpcDictionaryEncodingsUniqueIds(dictionary_encodings, &unique_ids);
+  if (result != NANOARROW_OK) {
+    ArrowErrorSet(error, "Failed to extract unique identifiers");
+    ArrowFree(private_data);
+    return result;
+  }
+
+  // unique_ids is a buffer of int64_t
+  private_data->num_dictionaries = unique_ids.size_bytes / sizeof(int64_t);
+
+  // Allocate the array of ArrowIpcDictionary
+  if (private_data->num_dictionaries > 0) {
+    private_data->dictionaries =
+        ArrowMalloc(private_data->num_dictionaries * sizeof(struct ArrowIpcDictionary));
+    if (private_data->dictionaries == NULL) {
+      ArrowErrorSet(error, "Failed to allocate ArrowIpcDictionary array");
+      ArrowBufferReset(&unique_ids);
+      ArrowFree(private_data);
+      return ENOMEM;
+    }
+  } else {
+    private_data->dictionaries = NULL;
+  }
+
+  int64_t num_initialized_dictionaries = 0;
+  result = ArrowIpcDictionariesInitDictionaries(private_data, dictionary_encodings,
+                                                &unique_ids,
+                                                &num_initialized_dictionaries, error);
+  ArrowBufferReset(&unique_ids);
+  if (result != NANOARROW_OK) {
+    for (int64_t i = 0; i < num_initialized_dictionaries; i++) {
+      ArrowIpcDictionaryReset(private_data->dictionaries + i);
+    }
+
+    ArrowFree(private_data->dictionaries);
+    ArrowFree(private_data);
+    return result;
+  }
+
+  dictionaries->private_data = private_data;
+  return NANOARROW_OK;
+}
+
+static struct ArrowIpcDictionary* ArrowIpcDictionariesFindById(
+    struct ArrowIpcDictionaries* dictionaries, int64_t id) {
+  NANOARROW_DCHECK(dictionaries != NULL);
+
+  struct ArrowIpcDictionariesPrivate* private_data =
+      (struct ArrowIpcDictionariesPrivate*)dictionaries->private_data;
+  for (int64_t i = 0; i < private_data->num_dictionaries; i++) {
+    struct ArrowIpcDictionary* dictionary = private_data->dictionaries + i;
+    if (dictionary->id == id) {
+      return dictionary;
+    }
+  }
+
+  return NULL;
+}
+
+ArrowErrorCode ArrowIpcDictionariesFindCurrentValue(
+    struct ArrowIpcDictionaries* dictionaries, int64_t id, const struct ArrowArray** out,
+    struct ArrowError* error) {
+  struct ArrowIpcDictionary* dictionary = ArrowIpcDictionariesFindById(dictionaries, id);
+  if (dictionary == NULL) {
+    ArrowErrorSet(error,
+                  "Can't find value for dictionary with ID %" PRId64
+                  " (dictionary definition not found)",
+                  id);
+    return EINVAL;
+  }
+
+  *out = &dictionary->current_value;
+  return NANOARROW_OK;
+}
+
+void ArrowIpcDictionariesReset(struct ArrowIpcDictionaries* dictionaries) {
+  NANOARROW_DCHECK(dictionaries != NULL);
+  struct ArrowIpcDictionariesPrivate* private_data =
+      (struct ArrowIpcDictionariesPrivate*)dictionaries->private_data;
+
+  for (int64_t i = 0; i < private_data->num_dictionaries; i++) {
+    struct ArrowIpcDictionary* dictionary = private_data->dictionaries + i;
+    ArrowIpcDictionaryReset(dictionary);
+  }
+
+  ArrowFree(private_data->dictionaries);
+  ArrowFree(private_data);
+  dictionaries->private_data = NULL;
 }
 
 ArrowErrorCode ArrowIpcDecoderInit(struct ArrowIpcDecoder* decoder) {
@@ -26173,8 +26508,6 @@ static inline int32_t ArrowIpcReadInt32LE(struct ArrowBufferView* data, int swap
   data->size_bytes -= sizeof(int32_t);
   return value;
 }
-
-#define ns(x) FLATBUFFERS_WRAP_NAMESPACE(org_apache_arrow_flatbuf, x)
 
 static int ArrowIpcDecoderSetMetadata(struct ArrowSchema* schema,
                                       ns(KeyValue_vec_t) kv_vec,
@@ -26656,10 +26989,16 @@ static int ArrowIpcDecoderSetType(struct ArrowSchema* schema, ns(Field_table_t) 
     case ns(Type_FixedSizeBinary):
       return ArrowIpcDecoderSetTypeFixedSizeBinary(schema, ns(Field_type_get(field)),
                                                    error);
+    case ns(Type_BinaryView):
+      ArrowErrorSet(error, "BinaryView not yet supported in IPC reader");
+      return ENOTSUP;
     case ns(Type_Utf8):
       return ArrowIpcDecoderSetTypeSimple(schema, NANOARROW_TYPE_STRING, error);
     case ns(Type_LargeUtf8):
       return ArrowIpcDecoderSetTypeSimple(schema, NANOARROW_TYPE_LARGE_STRING, error);
+    case ns(Type_Utf8View):
+      ArrowErrorSet(error, "Utf8View not yet supported in IPC reader");
+      return ENOTSUP;
     case ns(Type_Date):
       return ArrowIpcDecoderSetTypeDate(schema, ns(Field_type_get(field)), error);
     case ns(Type_Time):
@@ -26679,28 +27018,95 @@ static int ArrowIpcDecoderSetType(struct ArrowSchema* schema, ns(Field_table_t) 
     case ns(Type_FixedSizeList):
       return ArrowIpcDecoderSetTypeFixedSizeList(schema, ns(Field_type_get(field)),
                                                  error);
+    case ns(Type_ListView):
+    case ns(Type_LargeListView):
+      ArrowErrorSet(error, "ListView/LargeListView not yet supported in IPC reader");
+      return ENOTSUP;
     case ns(Type_Map):
       return ArrowIpcDecoderSetTypeMap(schema, ns(Field_type_get(field)), error);
     case ns(Type_Union):
       return ArrowIpcDecoderSetTypeUnion(schema, ns(Field_type_get(field)), n_children,
                                          error);
+    case ns(Type_RunEndEncoded):
+      ArrowErrorSet(error, "RunEndEncoded not yet supported in IPC reader");
+      return ENOTSUP;
     default:
       ArrowErrorSet(error, "Unrecognized Field type with value %d", type_type);
       return EINVAL;
   }
 }
 
+// When decoding dictionaries, we move the value type to the schema->dictionary
+// member, but we need to move the field metadata back because in IPC there
+// is no such thing as dictionary metadata (even extension metadata)
+// https://github.com/apache/arrow/issues/49704
+static int ArrowIpcMoveDictionaryMetadataBackToField(struct ArrowSchema* schema) {
+  NANOARROW_DCHECK(schema->dictionary != NULL);
+  NANOARROW_RETURN_NOT_OK(ArrowSchemaSetMetadata(schema, schema->dictionary->metadata));
+  NANOARROW_RETURN_NOT_OK(ArrowSchemaSetMetadata(schema->dictionary, NULL));
+  return NANOARROW_OK;
+}
+
+static int ArrowIpcSetDictionaryEncoding(
+    struct ArrowSchema* schema, ns(DictionaryEncoding_table_t dictionary_encoding),
+    struct ArrowIpcDictionaryEncodings* dictionaries, struct ArrowError* error) {
+  switch (
+      org_apache_arrow_flatbuf_DictionaryEncoding_dictionaryKind(dictionary_encoding)) {
+    case ns(DictionaryKind_DenseArray):
+      break;
+    default:
+      ArrowErrorSet(error, "Unexpected value for DictionaryKind");
+      return EINVAL;
+  }
+
+  struct ArrowSchema tmp;
+  ArrowSchemaMove(schema, &tmp);
+
+  ArrowSchemaInit(schema);
+  int result = ArrowSchemaAllocateDictionary(schema);
+  if (result != NANOARROW_OK) {
+    ArrowSchemaRelease(&tmp);
+    ArrowErrorSet(error, "ArrowSchemaAllocateDictionary() failed");
+    return result;
+  }
+
+  ArrowSchemaMove(&tmp, schema->dictionary);
+
+  NANOARROW_RETURN_NOT_OK_WITH_ERROR(ArrowSchemaSetName(schema, schema->dictionary->name),
+                                     error);
+  NANOARROW_RETURN_NOT_OK_WITH_ERROR(ArrowSchemaSetName(schema->dictionary, ""), error);
+
+  NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderSetTypeInt(
+      schema, ns(DictionaryEncoding_indexType_get(dictionary_encoding)), error));
+
+  if (ns(DictionaryEncoding_isOrdered_get(dictionary_encoding))) {
+    schema->flags |= ARROW_FLAG_DICTIONARY_ORDERED;
+  }
+
+  // Sort out field metadata between the schema and the dictionary member
+  NANOARROW_RETURN_NOT_OK_WITH_ERROR(ArrowIpcMoveDictionaryMetadataBackToField(schema),
+                                     error);
+
+  // Track the identifier if we have a dictionaries object in which to track it
+  if (dictionaries != NULL) {
+    int64_t id = ns(DictionaryEncoding_id(dictionary_encoding));
+    struct ArrowIpcDictionaryEncoding encoding = {
+        schema, id, NANOARROW_IPC_DICTIONARY_KIND_DENSE_ARRAY};
+
+    NANOARROW_RETURN_NOT_OK_WITH_ERROR(
+        ArrowIpcDictionaryEncodingsAppend(dictionaries, encoding), error);
+  }
+
+  return NANOARROW_OK;
+}
+
 static int ArrowIpcDecoderSetChildren(struct ArrowSchema* schema, ns(Field_vec_t) fields,
+                                      struct ArrowIpcDictionaryEncodings* dictionaries,
                                       struct ArrowError* error);
 
 static int ArrowIpcDecoderSetField(struct ArrowSchema* schema, ns(Field_table_t) field,
+                                   struct ArrowIpcDictionaryEncodings* dictionaries,
                                    struct ArrowError* error) {
-  // No dictionary support yet
-  if (ns(Field_dictionary_is_present(field))) {
-    ArrowErrorSet(error, "Schema message field with DictionaryEncoding not supported");
-    return ENOTSUP;
-  }
-
   int result;
   if (ns(Field_name_is_present(field))) {
     result = ArrowSchemaSetName(schema, ns(Field_name_get(field)));
@@ -26740,17 +27146,29 @@ static int ArrowIpcDecoderSetField(struct ArrowSchema* schema, ns(Field_table_t)
     ArrowSchemaInit(schema->children[i]);
   }
 
-  NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderSetChildren(schema, children, error));
-  return ArrowIpcDecoderSetMetadata(schema, ns(Field_custom_metadata(field)), error);
+  NANOARROW_RETURN_NOT_OK(
+      ArrowIpcDecoderSetChildren(schema, children, dictionaries, error));
+  NANOARROW_RETURN_NOT_OK(
+      ArrowIpcDecoderSetMetadata(schema, ns(Field_custom_metadata(field)), error));
+
+  // If this is a dictionary encoded field, set the dictionary encoding
+  if (ns(Field_dictionary_is_present(field))) {
+    NANOARROW_RETURN_NOT_OK(ArrowIpcSetDictionaryEncoding(
+        schema, ns(Field_dictionary(field)), dictionaries, error));
+  }
+
+  return NANOARROW_OK;
 }
 
 static int ArrowIpcDecoderSetChildren(struct ArrowSchema* schema, ns(Field_vec_t) fields,
+                                      struct ArrowIpcDictionaryEncodings* dictionaries,
                                       struct ArrowError* error) {
   int64_t n_fields = ns(Schema_vec_len(fields));
 
   for (int64_t i = 0; i < n_fields; i++) {
     ns(Field_table_t) field = ns(Field_vec_at(fields, i));
-    NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderSetField(schema->children[i], field, error));
+    NANOARROW_RETURN_NOT_OK(
+        ArrowIpcDecoderSetField(schema->children[i], field, dictionaries, error));
   }
 
   return NANOARROW_OK;
@@ -26794,6 +27212,19 @@ static int ArrowIpcDecoderDecodeSchemaHeader(struct ArrowIpcDecoder* decoder,
     }
   }
 
+  return NANOARROW_OK;
+}
+
+static int ArrowIpcDecoderDecodeDictionaryBatchHeader(
+    struct ArrowIpcDecoder* decoder, flatbuffers_generic_t message_header) {
+  struct ArrowIpcDecoderPrivate* private_data =
+      (struct ArrowIpcDecoderPrivate*)decoder->private_data;
+
+  ns(DictionaryBatch_table_t) dictionary = (ns(DictionaryBatch_table_t))message_header;
+  private_data->dictionary.id = ns(DictionaryBatch_id(dictionary));
+  private_data->dictionary.is_delta = ns(DictionaryBatch_isDelta(dictionary));
+
+  decoder->dictionary = &private_data->dictionary;
   return NANOARROW_OK;
 }
 
@@ -26867,6 +27298,8 @@ static inline void ArrowIpcDecoderResetHeaderInfo(struct ArrowIpcDecoder* decode
   decoder->codec = 0;
   decoder->header_size_bytes = 0;
   decoder->body_size_bytes = 0;
+  decoder->dictionary = NULL;
+  memset(&private_data->dictionary, 0, sizeof(struct ArrowIpcDictionaryBatch));
   decoder->footer = NULL;
   ArrowIpcFooterReset(&private_data->footer);
   private_data->last_message = NULL;
@@ -27109,11 +27542,14 @@ ArrowErrorCode ArrowIpcDecoderDecodeHeader(struct ArrowIpcDecoder* decoder,
       NANOARROW_RETURN_NOT_OK(
           ArrowIpcDecoderDecodeSchemaHeader(decoder, message_header, error));
       break;
+    case ns(MessageHeader_DictionaryBatch):
+      NANOARROW_RETURN_NOT_OK(
+          ArrowIpcDecoderDecodeDictionaryBatchHeader(decoder, message_header));
+      break;
     case ns(MessageHeader_RecordBatch):
       NANOARROW_RETURN_NOT_OK(
           ArrowIpcDecoderDecodeRecordBatchHeader(decoder, message_header, error));
       break;
-    case ns(MessageHeader_DictionaryBatch):
     case ns(MessageHeader_Tensor):
     case ns(MessageHeader_SparseTensor):
       ArrowErrorSet(error, "Unsupported message type: '%s'",
@@ -27128,9 +27564,10 @@ ArrowErrorCode ArrowIpcDecoderDecodeHeader(struct ArrowIpcDecoder* decoder,
   return NANOARROW_OK;
 }
 
-static ArrowErrorCode ArrowIpcDecoderDecodeSchemaImpl(ns(Schema_table_t) schema,
-                                                      struct ArrowSchema* out,
-                                                      struct ArrowError* error) {
+static ArrowErrorCode ArrowIpcDecoderDecodeSchemaImpl(
+    ns(Schema_table_t) schema, struct ArrowSchema* out,
+    struct ArrowIpcDictionaryEncodings* dictionary_encodings_out,
+    struct ArrowError* error) {
   ArrowSchemaInit(out);
   // Top-level batch schema is typically non-nullable
   out->flags = 0;
@@ -27145,15 +27582,17 @@ static ArrowErrorCode ArrowIpcDecoderDecodeSchemaImpl(ns(Schema_table_t) schema,
     return result;
   }
 
-  NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderSetChildren(out, fields, error));
+  NANOARROW_RETURN_NOT_OK(
+      ArrowIpcDecoderSetChildren(out, fields, dictionary_encodings_out, error));
   NANOARROW_RETURN_NOT_OK(
       ArrowIpcDecoderSetMetadata(out, ns(Schema_custom_metadata(schema)), error));
   return NANOARROW_OK;
 }
 
-ArrowErrorCode ArrowIpcDecoderDecodeSchema(struct ArrowIpcDecoder* decoder,
-                                           struct ArrowSchema* out,
-                                           struct ArrowError* error) {
+ArrowErrorCode ArrowIpcDecoderDecodeSchemaWithDictionaries(
+    struct ArrowIpcDecoder* decoder, struct ArrowSchema* out,
+    struct ArrowIpcDictionaryEncodings* dictionary_encodings_out,
+    struct ArrowError* error) {
   struct ArrowIpcDecoderPrivate* private_data =
       (struct ArrowIpcDecoderPrivate*)decoder->private_data;
 
@@ -27163,16 +27602,32 @@ ArrowErrorCode ArrowIpcDecoderDecodeSchema(struct ArrowIpcDecoder* decoder,
     return EINVAL;
   }
 
+  if (dictionary_encodings_out != NULL) {
+    ArrowIpcDictionaryEncodingsInit(dictionary_encodings_out);
+  }
+
   struct ArrowSchema tmp;
-  ArrowErrorCode result = ArrowIpcDecoderDecodeSchemaImpl(
-      (ns(Schema_table_t))private_data->last_message, &tmp, error);
+  ArrowErrorCode result =
+      ArrowIpcDecoderDecodeSchemaImpl((ns(Schema_table_t))private_data->last_message,
+                                      &tmp, dictionary_encodings_out, error);
 
   if (result != NANOARROW_OK) {
     ArrowSchemaRelease(&tmp);
+
+    if (dictionary_encodings_out != NULL) {
+      ArrowIpcDictionaryEncodingsReset(dictionary_encodings_out);
+    }
+
     return result;
   }
   ArrowSchemaMove(&tmp, out);
   return NANOARROW_OK;
+}
+
+ArrowErrorCode ArrowIpcDecoderDecodeSchema(struct ArrowIpcDecoder* decoder,
+                                           struct ArrowSchema* out,
+                                           struct ArrowError* error) {
+  return ArrowIpcDecoderDecodeSchemaWithDictionaries(decoder, out, NULL, error);
 }
 
 ArrowErrorCode ArrowIpcDecoderDecodeFooter(struct ArrowIpcDecoder* decoder,
@@ -27191,7 +27646,8 @@ ArrowErrorCode ArrowIpcDecoderDecodeFooter(struct ArrowIpcDecoder* decoder,
       ArrowIpcDecoderDecodeSchemaHeader(decoder, ns(Footer_schema(footer)), error));
 
   NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderDecodeSchemaImpl(
-      ns(Footer_schema(footer)), &private_data->footer.schema, error));
+      ns(Footer_schema(footer)), &private_data->footer.schema,
+      &private_data->footer.dictionaries, error));
 
   ns(Block_vec_t) blocks = ns(Footer_recordBatches(footer));
   int64_t n = ns(Block_vec_len(blocks));
@@ -27206,25 +27662,70 @@ ArrowErrorCode ArrowIpcDecoderDecodeFooter(struct ArrowIpcDecoder* decoder,
     record_batches[i].body_length = ns(Block_bodyLength(blocks + i));
   }
 
+  blocks = ns(Footer_dictionaries(footer));
+  n = ns(Block_vec_len(blocks));
+  NANOARROW_RETURN_NOT_OK(ArrowBufferResize(&private_data->footer.dictionary_blocks,
+                                            sizeof(struct ArrowIpcFileBlock) * n,
+                                            /*shrink_to_fit=*/0));
+  struct ArrowIpcFileBlock* dictionaries =
+      (struct ArrowIpcFileBlock*)private_data->footer.dictionary_blocks.data;
+  for (int64_t i = 0; i < n; i++) {
+    dictionaries[i].offset = ns(Block_offset(blocks + i));
+    dictionaries[i].metadata_length = ns(Block_metaDataLength(blocks + i));
+    dictionaries[i].body_length = ns(Block_bodyLength(blocks + i));
+  }
+
   decoder->footer = &private_data->footer;
   return NANOARROW_OK;
 }
 
-static void ArrowIpcDecoderCountFields(struct ArrowSchema* schema, int64_t* n_fields) {
+static void ArrowIpcDecoderCountFields(const struct ArrowSchema* schema,
+                                       int64_t* n_fields) {
   *n_fields += 1;
   for (int64_t i = 0; i < schema->n_children; i++) {
     ArrowIpcDecoderCountFields(schema->children[i], n_fields);
   }
 }
 
-static void ArrowIpcDecoderInitFields(struct ArrowIpcField* fields,
-                                      struct ArrowArrayView* array_view,
-                                      struct ArrowArray* array, int64_t* n_fields,
-                                      int64_t* n_buffers, int64_t* n_union_fields) {
+static ArrowErrorCode ArrowIpcDecoderInitFields(
+    struct ArrowIpcField* fields, const struct ArrowSchema* schema,
+    const struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    struct ArrowArrayView* array_view, struct ArrowArray* array, int64_t* n_fields,
+    int64_t* n_buffers, int64_t* n_union_fields, struct ArrowError* error) {
   struct ArrowIpcField* field = fields + (*n_fields);
   field->array_view = array_view;
   field->array = array;
   field->buffer_offset = *n_buffers;
+  field->dictionary_id = NANOARROW_IPC_NO_DICTIONARY_ID;
+
+  if (schema->dictionary != NULL) {
+    if (dictionary_encodings == NULL) {
+      const char* name = schema->name;
+      if (name == NULL) {
+        name = "<unnamed field>";
+      }
+
+      ArrowErrorSet(error,
+                    "Can't resolve dictionary ID for field '%s' (dictionary encodings "
+                    "not provided)",
+                    name);
+      return EINVAL;
+    }
+
+    const struct ArrowIpcDictionaryEncoding* dictionary_encoding =
+        ArrowIpcDictionaryEncodingsFind(dictionary_encodings, schema);
+    if (dictionary_encoding == NULL) {
+      const char* name = schema->name;
+      if (name == NULL) {
+        name = "<unnamed field>";
+      }
+
+      ArrowErrorSet(error, "Can't resolve dictionary ID for field '%s'", name);
+      return EINVAL;
+    }
+
+    field->dictionary_id = dictionary_encoding->id;
+  }
 
   for (int i = 0; i < NANOARROW_MAX_FIXED_BUFFERS; i++) {
     *n_buffers += array_view->layout.buffer_type[i] != NANOARROW_BUFFER_TYPE_NONE;
@@ -27235,14 +27736,18 @@ static void ArrowIpcDecoderInitFields(struct ArrowIpcField* fields,
   *n_fields += 1;
 
   for (int64_t i = 0; i < array_view->n_children; i++) {
-    ArrowIpcDecoderInitFields(fields, array_view->children[i], array->children[i],
-                              n_fields, n_buffers, n_union_fields);
+    NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderInitFields(
+        fields, schema->children[i], dictionary_encodings, array_view->children[i],
+        array->children[i], n_fields, n_buffers, n_union_fields, error));
   }
+
+  return NANOARROW_OK;
 }
 
-ArrowErrorCode ArrowIpcDecoderSetSchema(struct ArrowIpcDecoder* decoder,
-                                        struct ArrowSchema* schema,
-                                        struct ArrowError* error) {
+ArrowErrorCode ArrowIpcDecoderSetSchemaWithDictionaries(
+    struct ArrowIpcDecoder* decoder, const struct ArrowSchema* schema,
+    const struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    struct ArrowError* error) {
   struct ArrowIpcDecoderPrivate* private_data =
       (struct ArrowIpcDecoderPrivate*)decoder->private_data;
 
@@ -27283,11 +27788,18 @@ ArrowErrorCode ArrowIpcDecoderSetSchema(struct ArrowIpcDecoder* decoder,
 
   // Init field information and calculate starting buffer offset for each
   int64_t field_i = 0;
-  ArrowIpcDecoderInitFields(private_data->fields, &private_data->array_view,
-                            &private_data->array, &field_i, &private_data->n_buffers,
-                            &private_data->n_union_fields);
+  NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderInitFields(
+      private_data->fields, schema, dictionary_encodings, &private_data->array_view,
+      &private_data->array, &field_i, &private_data->n_buffers,
+      &private_data->n_union_fields, error));
 
   return NANOARROW_OK;
+}
+
+ArrowErrorCode ArrowIpcDecoderSetSchema(struct ArrowIpcDecoder* decoder,
+                                        const struct ArrowSchema* schema,
+                                        struct ArrowError* error) {
+  return ArrowIpcDecoderSetSchemaWithDictionaries(decoder, schema, NULL, error);
 }
 
 ArrowErrorCode ArrowIpcDecoderSetEndianness(struct ArrowIpcDecoder* decoder,
@@ -27329,7 +27841,7 @@ struct ArrowIpcBufferSource {
 /// has been read into memory. This abstraction is currently internal and exists
 /// to support the two obvious ways a user might go about this: (1) using a
 /// non-owned view of memory that must be copied slice-wise or (2) adding a reference
-/// to an ArrowIpcSharedBuffer and returning a slice of that memory.
+/// to an ArrowBuffer (shared buffer) and returning a slice of that memory.
 struct ArrowIpcBufferFactory {
   /// \brief User-defined callback to populate a buffer view
   ///
@@ -27348,7 +27860,14 @@ struct ArrowIpcBufferFactory {
   /// should be made.
   struct ArrowIpcDecompressor* decompressor;
 
-  /// \brief Caller-defined private data to be used in the callback.
+  /// \brief Buffer factory provided buffer length
+  ///
+  /// Rather than use the body length declared by the flatbuffer message, this is the
+  /// length that should be used to check the bounds of a buffer source (i.e., this is
+  /// the actual available length as opposed to the theoretical length).
+  int64_t buffer_length;
+
+  /// \brief User-defined private data to be used in the callback.
   ///
   /// Usually this would be a description of where the body has been read into memory or
   /// information required to do so.
@@ -27438,6 +27957,7 @@ static struct ArrowIpcBufferFactory ArrowIpcBufferFactoryFromView(
   struct ArrowIpcBufferFactory out;
   out.make_buffer = &ArrowIpcMakeBufferFromView;
   out.decompressor = NULL;
+  out.buffer_length = buffer_view->size_bytes;
   out.private_data = buffer_view;
   return out;
 }
@@ -27447,14 +27967,13 @@ static ArrowErrorCode ArrowIpcMakeBufferFromShared(struct ArrowIpcBufferFactory*
                                                    struct ArrowBufferView* dst_view,
                                                    struct ArrowBuffer* dst,
                                                    struct ArrowError* error) {
-  struct ArrowIpcSharedBuffer* shared =
-      (struct ArrowIpcSharedBuffer*)factory->private_data;
+  struct ArrowBuffer* shared = (struct ArrowBuffer*)factory->private_data;
 
   int needs_decompression = 0;
   int uncompressed_data_offset = 0;
   if (src->codec != NANOARROW_IPC_COMPRESSION_TYPE_NONE) {
     struct ArrowBufferView src_view;
-    src_view.data.as_uint8 = shared->private_src.data + src->body_offset_bytes;
+    src_view.data.as_uint8 = shared->data + src->body_offset_bytes;
     src_view.size_bytes = src->buffer_length_bytes;
     NANOARROW_RETURN_NOT_OK(ArrowIpcDecompressBufferFromView(
         factory->decompressor, src->codec, src_view, dst, &needs_decompression, error));
@@ -27463,7 +27982,7 @@ static ArrowErrorCode ArrowIpcMakeBufferFromShared(struct ArrowIpcBufferFactory*
 
   if (!needs_decompression) {
     ArrowBufferReset(dst);
-    ArrowIpcSharedBufferClone(shared, dst);
+    NANOARROW_RETURN_NOT_OK(ArrowSharedBufferClone(shared, dst));
     dst->data += src->body_offset_bytes + uncompressed_data_offset;
     dst->size_bytes = src->buffer_length_bytes - uncompressed_data_offset;
   }
@@ -27474,10 +27993,11 @@ static ArrowErrorCode ArrowIpcMakeBufferFromShared(struct ArrowIpcBufferFactory*
 }
 
 static struct ArrowIpcBufferFactory ArrowIpcBufferFactoryFromShared(
-    struct ArrowIpcSharedBuffer* shared) {
+    struct ArrowBuffer* shared) {
   struct ArrowIpcBufferFactory out;
   out.make_buffer = &ArrowIpcMakeBufferFromShared;
   out.decompressor = NULL;
+  out.buffer_length = shared->size_bytes;
   out.private_data = shared;
   return out;
 }
@@ -27612,10 +28132,10 @@ struct ArrowIpcArraySetter {
   int64_t field_i;
   ns(Buffer_vec_t) buffers;
   int64_t buffer_i;
-  int64_t body_size_bytes;
   struct ArrowIpcBufferSource src;
   struct ArrowIpcBufferFactory factory;
   enum ArrowIpcMetadataVersion version;
+  struct ArrowIpcDictionaries* dictionaries;
 };
 
 static int ArrowIpcDecoderMakeBuffer(struct ArrowIpcArraySetter* setter, int64_t offset,
@@ -27631,11 +28151,11 @@ static int ArrowIpcDecoderMakeBuffer(struct ArrowIpcArraySetter* setter, int64_t
   // Check that this buffer fits within the body
   int64_t buffer_start = offset;
   int64_t buffer_end = buffer_start + length;
-  if (buffer_start < 0 || buffer_end > setter->body_size_bytes) {
+  if (buffer_start < 0 || buffer_end > setter->factory.buffer_length) {
     ArrowErrorSet(error,
                   "Buffer requires body offsets [%" PRId64 "..%" PRId64
                   ") but body has size %" PRId64,
-                  buffer_start, buffer_end, setter->body_size_bytes);
+                  buffer_start, buffer_end, setter->factory.buffer_length);
     return EINVAL;
   }
 
@@ -27682,13 +28202,69 @@ static int ArrowIpcDecoderWalkGetArray(struct ArrowArrayView* array_view,
         array_view->children[i], array->children[i], out->children[i], error));
   }
 
+  if (array_view->dictionary != NULL) {
+    // Release the dictionary that was pre-initialized by ArrowArrayInitFromArrayView
+    if (out->dictionary->release != NULL) {
+      ArrowArrayRelease(out->dictionary);
+    }
+    // Move the pre-cloned shared dictionary to output (avoids copying)
+    ArrowArrayMove(array->dictionary, out->dictionary);
+  }
+
   return NANOARROW_OK;
 }
 
-static int ArrowIpcDecoderWalkSetArrayView(struct ArrowIpcArraySetter* setter,
+static int ArrowIpcDecoderWalkSetArrayView(struct ArrowIpcDecoder* decoder,
+                                           struct ArrowIpcArraySetter* setter,
                                            struct ArrowArrayView* array_view,
                                            struct ArrowArray* array,
                                            struct ArrowError* error) {
+  struct ArrowIpcDecoderPrivate* private_data =
+      (struct ArrowIpcDecoderPrivate*)decoder->private_data;
+
+  // setter->field_i indexes the flatbuffer FieldNode vector (which excludes the root
+  // struct), but private_data->fields includes the root at index 0, so add 1.
+  struct ArrowIpcField* ipc_field = private_data->fields + setter->field_i + 1;
+  if (ipc_field->dictionary_id != NANOARROW_IPC_NO_DICTIONARY_ID) {
+    if (setter->dictionaries == NULL) {
+      ArrowErrorSet(
+          error, "Can't decode a dictionary-encoded field without ArrowIpcDictionaries");
+      return ENOTSUP;
+    }
+
+    const struct ArrowArray* dictionary;
+    NANOARROW_RETURN_NOT_OK(ArrowIpcDictionariesFindCurrentValue(
+        setter->dictionaries, ipc_field->dictionary_id, &dictionary, error));
+
+    if (dictionary->release == NULL) {
+      ArrowErrorSet(error, "Dictionary with ID %" PRId64 " is marked as released",
+                    ipc_field->dictionary_id);
+      return EINVAL;
+    }
+
+    // Set the dictionary array view from the value. We may be able to skip this
+    // if we can somehow detect that the dictionary hasn't changed since the last
+    // decode.
+    NANOARROW_RETURN_NOT_OK(
+        ArrowArrayViewSetArray(array_view->dictionary, dictionary, error));
+
+    // Clone the shared dictionary for output (avoids copying dictionary data)
+    if (array->dictionary != NULL) {
+      if (array->dictionary->release != NULL) {
+        ArrowArrayRelease(array->dictionary);
+      }
+      int clone_result =
+          ArrowArrayCloneShared((struct ArrowArray*)dictionary, array->dictionary);
+      if (clone_result != NANOARROW_OK) {
+        ArrowErrorSet(error,
+                      "Failed to clone shared dictionary with ID %" PRId64
+                      " (dictionary may not be shared)",
+                      ipc_field->dictionary_id);
+        return clone_result;
+      }
+    }
+  }
+
   ns(FieldNode_struct_t) field =
       ns(FieldNode_vec_at(setter->fields, (size_t)setter->field_i));
   array_view->length = ns(FieldNode_length(field));
@@ -27742,7 +28318,7 @@ static int ArrowIpcDecoderWalkSetArrayView(struct ArrowIpcArraySetter* setter,
 
   for (int64_t i = 0; i < array_view->n_children; i++) {
     NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderWalkSetArrayView(
-        setter, array_view->children[i], array->children[i], error));
+        decoder, setter, array_view->children[i], array->children[i], error));
   }
 
   return NANOARROW_OK;
@@ -27791,15 +28367,10 @@ static ArrowErrorCode ArrowIpcDecoderDecodeArrayInternal(
 
 static ArrowErrorCode ArrowIpcDecoderDecodeArrayViewInternal(
     struct ArrowIpcDecoder* decoder, struct ArrowIpcBufferFactory factory,
-    int64_t field_i, struct ArrowArrayView** out_view, struct ArrowError* error) {
+    int64_t field_i, struct ArrowIpcDictionaries* dictionaries,
+    struct ArrowArrayView** out_view, struct ArrowError* error) {
   struct ArrowIpcDecoderPrivate* private_data =
       (struct ArrowIpcDecoderPrivate*)decoder->private_data;
-
-  if (private_data->last_message == NULL ||
-      decoder->message_type != NANOARROW_IPC_MESSAGE_TYPE_RECORD_BATCH) {
-    ArrowErrorSet(error, "decoder did not just decode a RecordBatch message");
-    return EINVAL;
-  }
 
   // RecordBatch messages don't count the root node but decoder->fields does
   // (decoder->fields[0] is the root field)
@@ -27818,11 +28389,11 @@ static ArrowErrorCode ArrowIpcDecoderDecodeArrayViewInternal(
   setter.field_i = field_i;
   setter.buffers = ns(RecordBatch_buffers(batch));
   setter.buffer_i = root->buffer_offset - 1;
-  setter.body_size_bytes = decoder->body_size_bytes;
   setter.factory = factory;
   setter.src.codec = decoder->codec;
   setter.src.swap_endian = ArrowIpcDecoderNeedsSwapEndian(decoder);
   setter.version = decoder->metadata_version;
+  setter.dictionaries = dictionaries;
 
   // If we are going to need a decompressor here, ensure the default one is
   // initialized.
@@ -27840,12 +28411,13 @@ static ArrowErrorCode ArrowIpcDecoderDecodeArrayViewInternal(
     setter.buffer_i++;
 
     for (int64_t i = 0; i < root->array_view->n_children; i++) {
-      NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderWalkSetArrayView(
-          &setter, root->array_view->children[i], root->array->children[i], error));
+      NANOARROW_RETURN_NOT_OK(
+          ArrowIpcDecoderWalkSetArrayView(decoder, &setter, root->array_view->children[i],
+                                          root->array->children[i], error));
     }
   } else {
-    NANOARROW_RETURN_NOT_OK(
-        ArrowIpcDecoderWalkSetArrayView(&setter, root->array_view, root->array, error));
+    NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderWalkSetArrayView(
+        decoder, &setter, root->array_view, root->array, error));
   }
 
   // If we decoded a compressed message, wait for any pending decompression tasks to
@@ -27859,12 +28431,61 @@ static ArrowErrorCode ArrowIpcDecoderDecodeArrayViewInternal(
   return NANOARROW_OK;
 }
 
+NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderDecodeArrayViewWithDictionaries(
+    struct ArrowIpcDecoder* decoder, struct ArrowBufferView body, int64_t i,
+    struct ArrowIpcDictionaries* dictionaries, struct ArrowArrayView** out,
+    struct ArrowError* error) {
+  struct ArrowIpcDecoderPrivate* private_data =
+      (struct ArrowIpcDecoderPrivate*)decoder->private_data;
+  if (private_data->last_message == NULL ||
+      decoder->message_type != NANOARROW_IPC_MESSAGE_TYPE_RECORD_BATCH) {
+    ArrowErrorSet(error, "decoder did not just decode a RecordBatch message");
+    return EINVAL;
+  }
+
+  return ArrowIpcDecoderDecodeArrayViewInternal(
+      decoder, ArrowIpcBufferFactoryFromView(&body), i, dictionaries, out, error);
+}
+
 ArrowErrorCode ArrowIpcDecoderDecodeArrayView(struct ArrowIpcDecoder* decoder,
                                               struct ArrowBufferView body, int64_t i,
                                               struct ArrowArrayView** out,
                                               struct ArrowError* error) {
-  return ArrowIpcDecoderDecodeArrayViewInternal(
-      decoder, ArrowIpcBufferFactoryFromView(&body), i, out, error);
+  return ArrowIpcDecoderDecodeArrayViewWithDictionaries(decoder, body, i, NULL, out,
+                                                        error);
+}
+
+NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderDecodeArrayWithDictionaries(
+    struct ArrowIpcDecoder* decoder, struct ArrowBufferView body, int64_t i,
+    struct ArrowIpcDictionaries* dictionaries, struct ArrowArray* out,
+    enum ArrowValidationLevel validation_level, struct ArrowError* error) {
+  struct ArrowIpcDecoderPrivate* private_data =
+      (struct ArrowIpcDecoderPrivate*)decoder->private_data;
+  if (private_data->last_message == NULL ||
+      decoder->message_type != NANOARROW_IPC_MESSAGE_TYPE_RECORD_BATCH) {
+    ArrowErrorSet(error, "decoder did not just decode a RecordBatch message");
+    return EINVAL;
+  }
+
+  struct ArrowArrayView* array_view;
+  NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderDecodeArrayViewInternal(
+      decoder, ArrowIpcBufferFactoryFromView(&body), i, dictionaries, &array_view,
+      error));
+
+  NANOARROW_RETURN_NOT_OK(ArrowArrayViewValidate(array_view, validation_level, error));
+
+  struct ArrowArray temp;
+  temp.release = NULL;
+  int result =
+      ArrowIpcDecoderDecodeArrayInternal(decoder, i, &temp, validation_level, error);
+  if (result != NANOARROW_OK && temp.release != NULL) {
+    ArrowArrayRelease(&temp);
+  } else if (result != NANOARROW_OK) {
+    return result;
+  }
+
+  ArrowArrayMove(&temp, out);
+  return NANOARROW_OK;
 }
 
 ArrowErrorCode ArrowIpcDecoderDecodeArray(struct ArrowIpcDecoder* decoder,
@@ -27872,9 +28493,18 @@ ArrowErrorCode ArrowIpcDecoderDecodeArray(struct ArrowIpcDecoder* decoder,
                                           struct ArrowArray* out,
                                           enum ArrowValidationLevel validation_level,
                                           struct ArrowError* error) {
+  return ArrowIpcDecoderDecodeArrayWithDictionaries(decoder, body, i, NULL, out,
+                                                    validation_level, error);
+}
+
+ArrowErrorCode ArrowIpcDecoderDecodeArrayFromSharedWithDictionaries(
+    struct ArrowIpcDecoder* decoder, struct ArrowBuffer* body, int64_t i,
+    struct ArrowIpcDictionaries* dictionaries, struct ArrowArray* out,
+    enum ArrowValidationLevel validation_level, struct ArrowError* error) {
   struct ArrowArrayView* array_view;
   NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderDecodeArrayViewInternal(
-      decoder, ArrowIpcBufferFactoryFromView(&body), i, &array_view, error));
+      decoder, ArrowIpcBufferFactoryFromShared(body), i, dictionaries, &array_view,
+      error));
 
   NANOARROW_RETURN_NOT_OK(ArrowArrayViewValidate(array_view, validation_level, error));
 
@@ -27893,27 +28523,102 @@ ArrowErrorCode ArrowIpcDecoderDecodeArray(struct ArrowIpcDecoder* decoder,
 }
 
 ArrowErrorCode ArrowIpcDecoderDecodeArrayFromShared(
-    struct ArrowIpcDecoder* decoder, struct ArrowIpcSharedBuffer* body, int64_t i,
+    struct ArrowIpcDecoder* decoder, struct ArrowBuffer* body, int64_t i,
     struct ArrowArray* out, enum ArrowValidationLevel validation_level,
     struct ArrowError* error) {
+  return ArrowIpcDecoderDecodeArrayFromSharedWithDictionaries(decoder, body, i, NULL, out,
+                                                              validation_level, error);
+}
+
+static ArrowErrorCode ArrowIpcDecoderDecodeDictionaryInternal(
+    struct ArrowIpcDecoder* decoder, struct ArrowIpcBufferFactory factory,
+    enum ArrowValidationLevel validation_level, struct ArrowIpcDictionaries* dictionaries,
+    struct ArrowError* error) {
+  struct ArrowIpcDecoderPrivate* private_data =
+      (struct ArrowIpcDecoderPrivate*)decoder->private_data;
+
+  if (decoder->message_type != NANOARROW_IPC_MESSAGE_TYPE_DICTIONARY_BATCH) {
+    ArrowErrorSet(error, "decoder did not just decode a DictionaryBatch message");
+    return EINVAL;
+  }
+
+  struct ArrowIpcDictionary* dictionary =
+      ArrowIpcDictionariesFindById(dictionaries, decoder->dictionary->id);
+  if (dictionary == NULL) {
+    ArrowErrorSet(error,
+                  "Can't decode DictionaryBatch with ID %" PRId64
+                  " (dictionary definition not found)",
+                  decoder->dictionary->id);
+    return EINVAL;
+  }
+
+  // Set the dictionary->decoder's last message type and last message so that we can
+  // decode the value.
+  ns(DictionaryBatch_table_t) dictionary_batch =
+      (ns(DictionaryBatch_table_t))private_data->last_message;
+  ns(RecordBatch_table_t) record_batch = ns(DictionaryBatch_data(dictionary_batch));
+
+  struct ArrowIpcDecoderPrivate* dictionary_decoder_private_data =
+      (struct ArrowIpcDecoderPrivate*)dictionary->decoder.private_data;
+  dictionary->decoder.message_type = NANOARROW_IPC_MESSAGE_TYPE_RECORD_BATCH;
+  dictionary_decoder_private_data->last_message = record_batch;
+  // Transfer the endianness setting so that buffers are byte-swapped if needed
+  dictionary_decoder_private_data->endianness = private_data->endianness;
+
   struct ArrowArrayView* array_view;
   NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderDecodeArrayViewInternal(
-      decoder, ArrowIpcBufferFactoryFromShared(body), i, &array_view, error));
+      &dictionary->decoder, factory, 0, dictionaries, &array_view, error));
 
   NANOARROW_RETURN_NOT_OK(ArrowArrayViewValidate(array_view, validation_level, error));
 
-  struct ArrowArray temp;
-  temp.release = NULL;
-  int result =
-      ArrowIpcDecoderDecodeArrayInternal(decoder, i, &temp, validation_level, error);
-  if (result != NANOARROW_OK && temp.release != NULL) {
-    ArrowArrayRelease(&temp);
+  struct ArrowArray tmp;
+  tmp.release = NULL;
+  int result = ArrowIpcDecoderDecodeArrayInternal(&dictionary->decoder, 0, &tmp,
+                                                  validation_level, error);
+  if (result != NANOARROW_OK && tmp.release != NULL) {
+    ArrowArrayRelease(&tmp);
+    return result;
   } else if (result != NANOARROW_OK) {
     return result;
   }
 
-  ArrowArrayMove(&temp, out);
+  if (decoder->dictionary->is_delta) {
+    result = ArrowIpcDictionaryAppend(dictionary, &tmp, error);
+  } else {
+    result = ArrowIpcDictionaryReplace(dictionary, &tmp, error);
+  }
+
+  if (result != NANOARROW_OK) {
+    ArrowArrayRelease(&tmp);
+    return result;
+  }
+
   return NANOARROW_OK;
+}
+
+NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderDecodeDictionary(
+    struct ArrowIpcDecoder* decoder, struct ArrowBufferView body,
+    enum ArrowValidationLevel validation_level, struct ArrowIpcDictionaries* dictionaries,
+    struct ArrowError* error) {
+  NANOARROW_DCHECK(decoder != NULL);
+  NANOARROW_DCHECK(dictionaries != NULL);
+
+  return ArrowIpcDecoderDecodeDictionaryInternal(decoder,
+                                                 ArrowIpcBufferFactoryFromView(&body),
+                                                 validation_level, dictionaries, error);
+}
+
+NANOARROW_DLL ArrowErrorCode ArrowIpcDecoderDecodeDictionaryFromShared(
+    struct ArrowIpcDecoder* decoder, struct ArrowBuffer* shared,
+    enum ArrowValidationLevel validation_level, struct ArrowIpcDictionaries* dictionaries,
+    struct ArrowError* error) {
+  NANOARROW_DCHECK(decoder != NULL);
+  NANOARROW_DCHECK(shared != NULL);
+  NANOARROW_DCHECK(dictionaries != NULL);
+
+  return ArrowIpcDecoderDecodeDictionaryInternal(decoder,
+                                                 ArrowIpcBufferFactoryFromShared(shared),
+                                                 validation_level, dictionaries, error);
 }
 // Licensed to the Apache Software Foundation (ASF) under one
 // or more contributor license agreements.  See the NOTICE file
@@ -27962,6 +28667,7 @@ struct ArrowIpcEncoderPrivate {
   struct ArrowBuffer buffers;
   struct ArrowBuffer nodes;
   int encoding_footer;
+  struct ArrowIpcDictionaryEncodings dictionary_encodings;
 };
 
 ArrowErrorCode ArrowIpcEncoderInit(struct ArrowIpcEncoder* encoder) {
@@ -27980,6 +28686,7 @@ ArrowErrorCode ArrowIpcEncoderInit(struct ArrowIpcEncoder* encoder) {
   private->encoding_footer = 0;
   ArrowBufferInit(&private->buffers);
   ArrowBufferInit(&private->nodes);
+  ArrowIpcDictionaryEncodingsInit(&private->dictionary_encodings);
   return NANOARROW_OK;
 }
 
@@ -27991,6 +28698,7 @@ void ArrowIpcEncoderReset(struct ArrowIpcEncoder* encoder) {
     flatcc_builder_clear(&private->builder);
     ArrowBufferReset(&private->nodes);
     ArrowBufferReset(&private->buffers);
+    ArrowIpcDictionaryEncodingsReset(&private->dictionary_encodings);
     ArrowFree(private);
   }
   memset(encoder, 0, sizeof(struct ArrowIpcEncoder));
@@ -28254,9 +28962,10 @@ static ArrowErrorCode ArrowIpcEncodeFieldType(flatcc_builder_t* builder,
   }
 }
 
-static ArrowErrorCode ArrowIpcEncodeField(flatcc_builder_t* builder,
-                                          const struct ArrowSchema* schema,
-                                          struct ArrowError* error);
+static ArrowErrorCode ArrowIpcEncodeField(
+    flatcc_builder_t* builder, const struct ArrowSchema* schema,
+    const struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    struct ArrowError* error);
 
 static ArrowErrorCode ArrowIpcEncodeMetadata(flatcc_builder_t* builder,
                                              const struct ArrowSchema* schema,
@@ -28281,36 +28990,109 @@ static ArrowErrorCode ArrowIpcEncodeMetadata(flatcc_builder_t* builder,
   return NANOARROW_OK;
 }
 
-static ArrowErrorCode ArrowIpcEncodeFields(flatcc_builder_t* builder,
-                                           const struct ArrowSchema* schema,
-                                           int (*push_start)(flatcc_builder_t*),
-                                           ns(Field_ref_t) *
-                                               (*push_end)(flatcc_builder_t*),
-                                           struct ArrowError* error) {
+static ArrowErrorCode ArrowIpcEncodeFields(
+    flatcc_builder_t* builder, const struct ArrowSchema* schema,
+    int (*push_start)(flatcc_builder_t*),
+    ns(Field_ref_t) * (*push_end)(flatcc_builder_t*),
+    const struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    struct ArrowError* error) {
   for (int i = 0; i < schema->n_children; i++) {
     FLATCC_RETURN_UNLESS_0_NO_NS(push_start(builder), error);
-    NANOARROW_RETURN_NOT_OK(ArrowIpcEncodeField(builder, schema->children[i], error));
+    NANOARROW_RETURN_NOT_OK(
+        ArrowIpcEncodeField(builder, schema->children[i], dictionary_encodings, error));
     FLATCC_RETURN_IF_NULL(push_end(builder), error);
   }
   return NANOARROW_OK;
 }
 
-static ArrowErrorCode ArrowIpcEncodeField(flatcc_builder_t* builder,
-                                          const struct ArrowSchema* schema,
-                                          struct ArrowError* error) {
+static ArrowErrorCode ArrowIpcEncodeField(
+    flatcc_builder_t* builder, const struct ArrowSchema* schema,
+    const struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    struct ArrowError* error) {
   FLATCC_RETURN_UNLESS_0(Field_name_create_str(builder, schema->name), error);
   FLATCC_RETURN_UNLESS_0(
       Field_nullable_add(builder, (schema->flags & ARROW_FLAG_NULLABLE) != 0), error);
 
   struct ArrowSchemaView schema_view;
   NANOARROW_RETURN_NOT_OK(ArrowSchemaViewInit(&schema_view, schema, error));
+
+  if (schema_view.type == NANOARROW_TYPE_DICTIONARY) {
+    const struct ArrowIpcDictionaryEncoding* encoding =
+        ArrowIpcDictionaryEncodingsFind(dictionary_encodings, schema);
+
+    // We just computed these dictionary ids, so we should be able to resolve them
+    if (encoding == NULL) {
+      ArrowErrorSet(error, "Unexpected missing dictionary encoding for field");
+      return EINVAL;
+    }
+
+    // Determine the index type's bitWidth and is_signed from the storage_type
+    int32_t index_bitwidth;
+    flatbuffers_bool_t index_is_signed;
+    switch (schema_view.storage_type) {
+      case NANOARROW_TYPE_INT8:
+        index_bitwidth = 8;
+        index_is_signed = 1;
+        break;
+      case NANOARROW_TYPE_UINT8:
+        index_bitwidth = 8;
+        index_is_signed = 0;
+        break;
+      case NANOARROW_TYPE_INT16:
+        index_bitwidth = 16;
+        index_is_signed = 1;
+        break;
+      case NANOARROW_TYPE_UINT16:
+        index_bitwidth = 16;
+        index_is_signed = 0;
+        break;
+      case NANOARROW_TYPE_INT32:
+        index_bitwidth = 32;
+        index_is_signed = 1;
+        break;
+      case NANOARROW_TYPE_UINT32:
+        index_bitwidth = 32;
+        index_is_signed = 0;
+        break;
+      case NANOARROW_TYPE_INT64:
+        index_bitwidth = 64;
+        index_is_signed = 1;
+        break;
+      case NANOARROW_TYPE_UINT64:
+        index_bitwidth = 64;
+        index_is_signed = 0;
+        break;
+      default:
+        ArrowErrorSet(error, "Invalid dictionary index type: %s",
+                      ArrowTypeString(schema_view.storage_type));
+        return EINVAL;
+    }
+
+    // Create the Int type for the index type
+    ns(Int_ref_t) index_type_ref =
+        ns(Int_create(builder, index_bitwidth, index_is_signed));
+    FLATCC_RETURN_IF_NULL(index_type_ref, error);
+
+    // Create the DictionaryEncoding with id, indexType, isOrdered, and dictionaryKind
+    flatbuffers_bool_t is_ordered = (schema->flags & ARROW_FLAG_DICTIONARY_ORDERED) != 0;
+    ns(DictionaryEncoding_ref_t) dict_encoding_ref =
+        ns(DictionaryEncoding_create(builder, encoding->id, index_type_ref, is_ordered,
+                                     ns(DictionaryKind_DenseArray)));
+    FLATCC_RETURN_IF_NULL(dict_encoding_ref, error);
+
+    // Add the dictionary encoding to the field
+    FLATCC_RETURN_UNLESS_0(Field_dictionary_add(builder, dict_encoding_ref), error);
+
+    NANOARROW_RETURN_NOT_OK(ArrowSchemaViewInit(&schema_view, schema->dictionary, error));
+  }
+
   NANOARROW_RETURN_NOT_OK(ArrowIpcEncodeFieldType(builder, &schema_view, error));
 
   if (schema->n_children != 0) {
     FLATCC_RETURN_UNLESS_0(Field_children_start(builder), error);
-    NANOARROW_RETURN_NOT_OK(ArrowIpcEncodeFields(builder, schema,
-                                                 &ns(Field_children_push_start),
-                                                 &ns(Field_children_push_end), error));
+    NANOARROW_RETURN_NOT_OK(
+        ArrowIpcEncodeFields(builder, schema, &ns(Field_children_push_start),
+                             &ns(Field_children_push_end), dictionary_encodings, error));
     FLATCC_RETURN_UNLESS_0(Field_children_end(builder), error);
   }
 
@@ -28324,9 +29106,10 @@ static ArrowErrorCode ArrowIpcEncodeField(flatcc_builder_t* builder,
   return NANOARROW_OK;
 }
 
-static ArrowErrorCode ArrowIpcEncodeSchema(flatcc_builder_t* builder,
-                                           const struct ArrowSchema* schema,
-                                           struct ArrowError* error) {
+static ArrowErrorCode ArrowIpcEncodeSchema(
+    flatcc_builder_t* builder, const struct ArrowSchema* schema,
+    const struct ArrowIpcDictionaryEncodings* dictionary_encodings,
+    struct ArrowError* error) {
   NANOARROW_DCHECK(schema->release != NULL);
 
   if (strcmp(schema->format, "+s") != 0) {
@@ -28344,9 +29127,9 @@ static ArrowErrorCode ArrowIpcEncodeSchema(flatcc_builder_t* builder,
   }
 
   FLATCC_RETURN_UNLESS_0(Schema_fields_start(builder), error);
-  NANOARROW_RETURN_NOT_OK(ArrowIpcEncodeFields(builder, schema,
-                                               &ns(Schema_fields_push_start),
-                                               &ns(Schema_fields_push_end), error));
+  NANOARROW_RETURN_NOT_OK(
+      ArrowIpcEncodeFields(builder, schema, &ns(Schema_fields_push_start),
+                           &ns(Schema_fields_push_end), dictionary_encodings, error));
   FLATCC_RETURN_UNLESS_0(Schema_fields_end(builder), error);
 
   FLATCC_RETURN_UNLESS_0(Schema_custom_metadata_start(builder), error);
@@ -28378,7 +29161,19 @@ ArrowErrorCode ArrowIpcEncoderEncodeSchema(struct ArrowIpcEncoder* encoder,
   FLATCC_RETURN_UNLESS_0(Message_version_add(builder, ns(MetadataVersion_V5)), error);
 
   FLATCC_RETURN_UNLESS_0(Message_header_Schema_start(builder), error);
-  NANOARROW_RETURN_NOT_OK(ArrowIpcEncodeSchema(builder, schema, error));
+
+  // Look for any fields of the schema that should be dictionary encoded
+  if (private->dictionary_encodings.encodings.size_bytes > 0) {
+    ArrowIpcDictionaryEncodingsReset(&private->dictionary_encodings);
+    ArrowIpcDictionaryEncodingsInit(&private->dictionary_encodings);
+  }
+  NANOARROW_RETURN_NOT_OK_WITH_ERROR(
+      ArrowIpcDictionaryEncodingsAppendSchema(&private->dictionary_encodings, schema),
+      error);
+
+  NANOARROW_RETURN_NOT_OK(
+      ArrowIpcEncodeSchema(builder, schema, &private->dictionary_encodings, error));
+
   FLATCC_RETURN_UNLESS_0(Message_header_Schema_end(builder), error);
 
   FLATCC_RETURN_UNLESS_0(Message_bodyLength_add(builder, 0), error);
@@ -28452,6 +29247,11 @@ static ArrowErrorCode ArrowIpcEncoderEncodeRecordBatchImpl(
     struct ArrowBuffer* nodes, struct ArrowError* error) {
   if (array_view->offset != 0) {
     ArrowErrorSet(error, "Cannot encode arrays with nonzero offset");
+    return ENOTSUP;
+  }
+
+  if (array_view->dictionary != NULL) {
+    ArrowErrorSet(error, "Cannot encode dictionary arrays");
     return ENOTSUP;
   }
 
@@ -28546,6 +29346,8 @@ ArrowErrorCode ArrowIpcEncoderEncodeSimpleRecordBatch(
 void ArrowIpcFooterInit(struct ArrowIpcFooter* footer) {
   footer->schema.release = NULL;
   ArrowBufferInit(&footer->record_batch_blocks);
+  ArrowBufferInit(&footer->dictionary_blocks);
+  ArrowIpcDictionaryEncodingsInit(&footer->dictionaries);
 }
 
 void ArrowIpcFooterReset(struct ArrowIpcFooter* footer) {
@@ -28553,6 +29355,8 @@ void ArrowIpcFooterReset(struct ArrowIpcFooter* footer) {
     ArrowSchemaRelease(&footer->schema);
   }
   ArrowBufferReset(&footer->record_batch_blocks);
+  ArrowBufferReset(&footer->dictionary_blocks);
+  ArrowIpcDictionaryEncodingsReset(&footer->dictionaries);
 }
 
 ArrowErrorCode ArrowIpcEncoderEncodeFooter(struct ArrowIpcEncoder* encoder,
@@ -28570,7 +29374,8 @@ ArrowErrorCode ArrowIpcEncoderEncodeFooter(struct ArrowIpcEncoder* encoder,
   FLATCC_RETURN_UNLESS_0(Footer_version_add(builder, ns(MetadataVersion_V5)), error);
 
   FLATCC_RETURN_UNLESS_0(Footer_schema_start(builder), error);
-  NANOARROW_RETURN_NOT_OK(ArrowIpcEncodeSchema(builder, &footer->schema, error));
+  NANOARROW_RETURN_NOT_OK(
+      ArrowIpcEncodeSchema(builder, &footer->schema, &footer->dictionaries, error));
   FLATCC_RETURN_UNLESS_0(Footer_schema_end(builder), error);
 
   const struct ArrowIpcFileBlock* blocks =
@@ -28620,8 +29425,9 @@ ArrowErrorCode ArrowIpcEncoderEncodeFooter(struct ArrowIpcEncoder* encoder,
 #include "nanoarrow/nanoarrow.h"
 #include "nanoarrow/nanoarrow_ipc.h"
 
-// R 3.6 / Windows builds on a very old toolchain that does not define ENODATA
-#if defined(_WIN32) && !defined(_MSC_VER) && !defined(ENODATA)
+// ENODATA is an XSI extension and is not defined by all libcs (e.g., older
+// Windows/MinGW toolchains used by R 3.6, FreeBSD, and OpenBSD).
+#if !defined(ENODATA)
 #define ENODATA 120
 #endif
 
@@ -28788,6 +29594,7 @@ struct ArrowIpcArrayStreamReaderPrivate {
   struct ArrowBuffer header;
   struct ArrowBuffer body;
   int32_t expected_header_prefix_size;
+  struct ArrowIpcDictionaries dictionaries;
   struct ArrowError error;
 };
 
@@ -28808,13 +29615,16 @@ static void ArrowIpcArrayStreamReaderRelease(struct ArrowArrayStream* stream) {
   ArrowBufferReset(&private_data->header);
   ArrowBufferReset(&private_data->body);
 
+  if (private_data->dictionaries.private_data != NULL) {
+    ArrowIpcDictionariesReset(&private_data->dictionaries);
+  }
+
   ArrowFree(private_data);
   stream->release = NULL;
 }
 
 static int ArrowIpcArrayStreamReaderNextHeader(
-    struct ArrowIpcArrayStreamReaderPrivate* private_data,
-    enum ArrowIpcMessageType message_type) {
+    struct ArrowIpcArrayStreamReaderPrivate* private_data, int schema_expected) {
   private_data->header.size_bytes = 0;
   int64_t bytes_read = 0;
 
@@ -28929,7 +29739,10 @@ static int ArrowIpcArrayStreamReaderNextHeader(
 
   // Don't decode the message if it's of the wrong type (because the error message
   // is better communicated by the caller)
-  if (private_data->decoder.message_type != message_type) {
+  if ((schema_expected &&
+       private_data->decoder.message_type != NANOARROW_IPC_MESSAGE_TYPE_SCHEMA) ||
+      (!schema_expected &&
+       private_data->decoder.message_type == NANOARROW_IPC_MESSAGE_TYPE_SCHEMA)) {
     return NANOARROW_OK;
   }
 
@@ -28969,8 +29782,7 @@ static int ArrowIpcArrayStreamReaderReadSchemaIfNeeded(
     return NANOARROW_OK;
   }
 
-  NANOARROW_RETURN_NOT_OK(ArrowIpcArrayStreamReaderNextHeader(
-      private_data, NANOARROW_IPC_MESSAGE_TYPE_SCHEMA));
+  NANOARROW_RETURN_NOT_OK(ArrowIpcArrayStreamReaderNextHeader(private_data, 1));
 
   // Error if this isn't a schema message
   if (private_data->decoder.message_type != NANOARROW_IPC_MESSAGE_TYPE_SCHEMA) {
@@ -29000,20 +29812,33 @@ static int ArrowIpcArrayStreamReaderReadSchemaIfNeeded(
       &private_data->error);
 
   struct ArrowSchema tmp;
-  NANOARROW_RETURN_NOT_OK(
-      ArrowIpcDecoderDecodeSchema(&private_data->decoder, &tmp, &private_data->error));
+  struct ArrowIpcDictionaryEncodings dictionary_encodings;
+  NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderDecodeSchemaWithDictionaries(
+      &private_data->decoder, &tmp, &dictionary_encodings, &private_data->error));
 
   // Only support "read the whole thing" for now
   if (private_data->field_index != -1) {
     ArrowSchemaRelease(&tmp);
+    ArrowIpcDictionaryEncodingsReset(&dictionary_encodings);
     ArrowErrorSet(&private_data->error, "Field index != -1 is not yet supported");
     return ENOTSUP;
   }
 
-  // Notify the decoder of the schema for forthcoming messages
-  int result =
-      ArrowIpcDecoderSetSchema(&private_data->decoder, &tmp, &private_data->error);
+  // Initialize dictionary decoders
+  int result = ArrowIpcDictionariesInit(&private_data->dictionaries,
+                                        &dictionary_encodings, &private_data->error);
   if (result != NANOARROW_OK) {
+    ArrowIpcDictionaryEncodingsReset(&dictionary_encodings);
+    ArrowSchemaRelease(&tmp);
+    return result;
+  }
+
+  // Notify the decoder of the schema for forthcoming messages
+  result = ArrowIpcDecoderSetSchemaWithDictionaries(
+      &private_data->decoder, &tmp, &dictionary_encodings, &private_data->error);
+  ArrowIpcDictionaryEncodingsReset(&dictionary_encodings);
+  if (result != NANOARROW_OK) {
+    ArrowIpcDictionariesReset(&private_data->dictionaries);
     ArrowSchemaRelease(&tmp);
     return result;
   }
@@ -29031,19 +29856,72 @@ static int ArrowIpcArrayStreamReaderGetSchema(struct ArrowArrayStream* stream,
   return ArrowSchemaDeepCopy(&private_data->out_schema, out);
 }
 
-static int ArrowIpcArrayStreamReaderGetNext(struct ArrowArrayStream* stream,
-                                            struct ArrowArray* out) {
-  struct ArrowIpcArrayStreamReaderPrivate* private_data =
-      (struct ArrowIpcArrayStreamReaderPrivate*)stream->private_data;
-  ArrowErrorInit(&private_data->error);
-  NANOARROW_RETURN_NOT_OK(ArrowIpcArrayStreamReaderReadSchemaIfNeeded(private_data));
+static int ArrowIpcArrayStreamReaderProcessRecordBatch(
+    struct ArrowIpcArrayStreamReaderPrivate* private_data, struct ArrowArray* out) {
+  // Read in the body
+  NANOARROW_RETURN_NOT_OK(ArrowIpcArrayStreamReaderNextBody(private_data));
 
+  if (private_data->use_shared_buffers) {
+    struct ArrowBuffer shared;
+    NANOARROW_RETURN_NOT_OK_WITH_ERROR(
+        ArrowSharedBufferInit(&shared, &private_data->body), &private_data->error);
+    ArrowErrorCode result = ArrowIpcDecoderDecodeArrayFromSharedWithDictionaries(
+        &private_data->decoder, &shared, private_data->field_index,
+        &private_data->dictionaries, out, NANOARROW_VALIDATION_LEVEL_FULL,
+        &private_data->error);
+    ArrowBufferReset(&shared);
+    NANOARROW_RETURN_NOT_OK(result);
+  } else {
+    struct ArrowBufferView body_view;
+    body_view.data.data = private_data->body.data;
+    body_view.size_bytes = private_data->body.size_bytes;
+
+    NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderDecodeArrayWithDictionaries(
+        &private_data->decoder, body_view, private_data->field_index,
+        &private_data->dictionaries, out, NANOARROW_VALIDATION_LEVEL_FULL,
+        &private_data->error));
+  }
+
+  return NANOARROW_OK;
+}
+
+static int ArrowIpcArrayStreamReaderProcessDictionary(
+    struct ArrowIpcArrayStreamReaderPrivate* private_data) {
+  // Read in the body
+  NANOARROW_RETURN_NOT_OK(ArrowIpcArrayStreamReaderNextBody(private_data));
+
+  if (private_data->use_shared_buffers) {
+    // Decode the dictionary
+    struct ArrowBuffer shared;
+    NANOARROW_RETURN_NOT_OK_WITH_ERROR(
+        ArrowSharedBufferInit(&shared, &private_data->body), &private_data->error);
+    int result = ArrowIpcDecoderDecodeDictionaryFromShared(
+        &private_data->decoder, &shared, NANOARROW_VALIDATION_LEVEL_FULL,
+        &private_data->dictionaries, &private_data->error);
+    ArrowBufferReset(&shared);
+    NANOARROW_RETURN_NOT_OK(result);
+  } else {
+    struct ArrowBufferView body_view;
+    body_view.data.data = private_data->body.data;
+    body_view.size_bytes = private_data->body.size_bytes;
+    NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderDecodeDictionary(
+        &private_data->decoder, body_view, NANOARROW_VALIDATION_LEVEL_FULL,
+        &private_data->dictionaries, &private_data->error));
+  }
+
+  return NANOARROW_OK;
+}
+
+static int ArrowIpcArrayStreamReaderProcessMessage(
+    struct ArrowIpcArrayStreamReaderPrivate* private_data,
+    enum ArrowIpcMessageType* message_type, struct ArrowArray* out) {
   // Read + decode the next header
-  int result = ArrowIpcArrayStreamReaderNextHeader(
-      private_data, NANOARROW_IPC_MESSAGE_TYPE_RECORD_BATCH);
+  int result = ArrowIpcArrayStreamReaderNextHeader(private_data, 0);
   if (result == ENODATA) {
     // Stream is finished either because there is no input or because
-    // end of stream bytes were read.
+    // end of stream bytes were read. Read this as a RecordBatch in the
+    // sense that we populate out->release to NULL and return OK.
+    *message_type = NANOARROW_IPC_MESSAGE_TYPE_RECORD_BATCH;
     out->release = NULL;
     return NANOARROW_OK;
   } else if (result != NANOARROW_OK) {
@@ -29051,35 +29929,43 @@ static int ArrowIpcArrayStreamReaderGetNext(struct ArrowArrayStream* stream,
     return result;
   }
 
-  // Make sure we have a RecordBatch message
-  if (private_data->decoder.message_type != NANOARROW_IPC_MESSAGE_TYPE_RECORD_BATCH) {
-    ArrowErrorSet(&private_data->error, "Unexpected message type (expected RecordBatch)");
-    return EINVAL;
+  // Make sure we have a RecordBatch message or DictionaryBatch message
+  switch (private_data->decoder.message_type) {
+    case NANOARROW_IPC_MESSAGE_TYPE_RECORD_BATCH:
+      *message_type = NANOARROW_IPC_MESSAGE_TYPE_RECORD_BATCH;
+      return ArrowIpcArrayStreamReaderProcessRecordBatch(private_data, out);
+    case NANOARROW_IPC_MESSAGE_TYPE_DICTIONARY_BATCH:
+      *message_type = NANOARROW_IPC_MESSAGE_TYPE_DICTIONARY_BATCH;
+      return ArrowIpcArrayStreamReaderProcessDictionary(private_data);
+    default:
+      ArrowErrorSet(&private_data->error,
+                    "Unexpected message type (expected RecordBatch or DictionaryBatch)");
+      return EINVAL;
   }
+}
 
-  // Read in the body
-  NANOARROW_RETURN_NOT_OK(ArrowIpcArrayStreamReaderNextBody(private_data));
+static int ArrowIpcArrayStreamReaderGetNext(struct ArrowArrayStream* stream,
+                                            struct ArrowArray* out) {
+  struct ArrowIpcArrayStreamReaderPrivate* private_data =
+      (struct ArrowIpcArrayStreamReaderPrivate*)stream->private_data;
+  ArrowErrorInit(&private_data->error);
+  NANOARROW_RETURN_NOT_OK(ArrowIpcArrayStreamReaderReadSchemaIfNeeded(private_data));
 
+  enum ArrowIpcMessageType message_type;
   struct ArrowArray tmp;
+  tmp.release = NULL;
 
-  if (private_data->use_shared_buffers) {
-    struct ArrowIpcSharedBuffer shared;
-    NANOARROW_RETURN_NOT_OK_WITH_ERROR(
-        ArrowIpcSharedBufferInit(&shared, &private_data->body), &private_data->error);
-    result = ArrowIpcDecoderDecodeArrayFromShared(
-        &private_data->decoder, &shared, private_data->field_index, &tmp,
-        NANOARROW_VALIDATION_LEVEL_FULL, &private_data->error);
-    ArrowIpcSharedBufferReset(&shared);
-    NANOARROW_RETURN_NOT_OK(result);
-  } else {
-    struct ArrowBufferView body_view;
-    body_view.data.data = private_data->body.data;
-    body_view.size_bytes = private_data->body.size_bytes;
+  do {
+    int result =
+        ArrowIpcArrayStreamReaderProcessMessage(private_data, &message_type, &tmp);
+    if (result != NANOARROW_OK) {
+      if (tmp.release != NULL) {
+        ArrowArrayRelease(&tmp);
+      }
 
-    NANOARROW_RETURN_NOT_OK(ArrowIpcDecoderDecodeArray(
-        &private_data->decoder, body_view, private_data->field_index, &tmp,
-        NANOARROW_VALIDATION_LEVEL_FULL, &private_data->error));
-  }
+      return result;
+    }
+  } while (message_type != NANOARROW_IPC_MESSAGE_TYPE_RECORD_BATCH);
 
   ArrowArrayMove(&tmp, out);
   return NANOARROW_OK;
@@ -29113,13 +29999,14 @@ ArrowErrorCode ArrowIpcArrayStreamReaderInit(
   private_data->out_schema.release = NULL;
   ArrowIpcInputStreamMove(input_stream, &private_data->input);
   private_data->expected_header_prefix_size = kExpectedHeaderPrefixSizeNotSet;
+  private_data->dictionaries.private_data = NULL;
 
   if (options != NULL) {
     private_data->field_index = options->field_index;
     private_data->use_shared_buffers = options->use_shared_buffers;
   } else {
     private_data->field_index = -1;
-    private_data->use_shared_buffers = ArrowIpcSharedBufferIsThreadSafe();
+    private_data->use_shared_buffers = ArrowSharedBufferIsThreadSafe();
   }
 
   out->private_data = private_data;
